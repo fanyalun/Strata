@@ -46,6 +46,29 @@ class DraftLayer(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.apply(cfg, {"mtp": "off"})
 
+    def test_three_level_cannot_silently_drop_mtp_or_enable_batching(self):
+        args = ["--pack", "/p", "--mtp", "/m/rt", "--three-level"]
+        self.assertEqual(engine_args({"args": args, "drafting": "auto"}), args)
+        self.assertEqual(engine_args({"args": args, "gpu": [0], "layer_split": "auto"}), args)
+        for config in ({"mtp": False}, {"drafting": "off"}, {"drafting": "dflash2"},
+                       {"parallel": 2}, {"gpu": [0, 1]}, {"backend": "hip"},
+                       {"replicas": [[0]]}, {"split_serve": {"prefill_gpu": 0}},
+                       {"vision": {}}, {"vision": {"gpu": True}}, {"sampling": {"temperature": 0.7}},
+                       {"reasoning_close_retry": True}, {"reasoning_budget_tokens": 20},
+                       {"reasoning_loop_recovery": "recover"}):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "three-level"):
+                engine_args({"args": args, **config})
+        for extra in (["--mtp", "0"], ["--three-level-loops", "7"], ["--three-level-depth", "0"],
+                      ["--three-level-depth", "2.5"], ["--preverify-top-h", "11"], ["--batch", "1"],
+                      ["--three-level-loops"]):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "three-level"):
+                engine_args({"args": args + extra})
+        with self.assertRaisesRegex(ValueError, "three-level"):
+            engine_args({"args": args + ["--preverify-top-h", "9"], "arch": "qwen35moe"})
+        with self.assertRaisesRegex(ValueError, "three-level"):
+            engine_args({"args": args, "user_args": ["--mtp", "0"]})
+        self.assertIn("--three-level", engine_args({"args": args, "sampling": {"temperature": 0}}))
+
 
 if __name__ == "__main__":
     unittest.main()

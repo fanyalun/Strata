@@ -278,7 +278,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     max_t_ = max_t;
     rt_dir_ = rt_dir;
     // (the draft layer's kernels - the resident grouping, the grouped experts, the fused reads - are built for the narrow window)
-    if (max_t < 1 || max_t > strata::kernels::kVerifyNarrowT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > strata::kernels::kSequenceVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr ||
             shared->experts_ == nullptr || shared->rt_dir_ != rt_dir) {
@@ -429,7 +429,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); bo_ = b.take<float>(T * N);
         xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xq_ = b.take<uint8_t>(std::max(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8),
+                                     strata::kernels::native_q8_1_bytes((int) N, (int) T)));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
@@ -962,7 +963,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         g_mp.stamp(2, cs);
         // ---- the attention hyper-connection
         {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
                 fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
@@ -1086,7 +1087,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(7, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
                 fa[t].bo_prev = bo_ + t * N; fa[t].inj_prev = inj_ + t * HC;
@@ -1205,7 +1206,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
                 fa[t].bo_prev = y_ + t * N; fa[t].inj_prev = inj2_ + t * HC;
@@ -1219,7 +1220,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_on) {
             // the window's rows in one read (CUDA; HIP keeps gr_read per row): bitwise the same sums
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
                 fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
@@ -1572,7 +1573,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 namespace {
 struct DraftTiming {
     bool on = false;
-    cudaEvent_t eb[16] = {}, ea[16] = {};
+    cudaEvent_t eb[strata::kernels::kSequenceVerifyMaxT] = {}, ea[strata::kernels::kSequenceVerifyMaxT] = {};
     double round_ms = 0, step_ms = 0, gap_ms = 0, wall_ms = 0, tail_ms = 0;
     double pre_ms = 0, launch_ms = 0, ple_ms = 0, wait0_ms = 0, waitj_ms = 0;   // host: staging, graph launch calls, PLE prefetch, spins
     int64_t rounds = 0, steps = 0;
@@ -1582,7 +1583,7 @@ struct DraftTiming {
     }
     void init() {
         if (!on || eb[0] != nullptr) return;
-        for (int i = 0; i < 16; ++i)
+        for (int i = 0; i < strata::kernels::kSequenceVerifyMaxT; ++i)
             if (cudaEventCreate(&eb[i]) != cudaSuccess || cudaEventCreate(&ea[i]) != cudaSuccess) { on = false; (void) cudaGetLastError(); return; }
     }
     void report() const {
@@ -1804,6 +1805,14 @@ bool MtpDrafter::stage_source_R(int T, std::string& err) {
     return true;
 }
 
+bool MtpDrafter::prepare_draft(std::string& err) {
+    const OnDevice on_device(device_);
+    if (!capture_round(1, false, err)) return false;
+    for (int j = 1; j <= max_t_ - 2; ++j)
+        if (!capture_step(j, false, err)) return false;
+    return true;
+}
+
 bool MtpDrafter::prepare_chain(std::string& err) {
     const OnDevice on_device(device_);
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
@@ -1918,12 +1927,14 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
-    for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
-            err = "mtp: staging the first residual failed";
+    for (int t = 0; t < T; ++t) {
+        const cudaError_t copied = cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row,
+                                             (size_t) HCN * sizeof(float), cudaMemcpyDeviceToDevice);
+        if (copied != cudaSuccess) {
+            err = std::string("mtp: staging the first residual failed: ") + cudaGetErrorString(copied);
             return false;
         }
+    }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts, result);
 }

@@ -1,0 +1,185 @@
+{
+  "binary_sha256": "b48e56e60778145082ac58a6ccb639a5bd10794eef00b6ba2471af12aaca20a0",
+  "passed": true,
+  "performance_claim": false,
+  "cases": {
+    "injected": {
+      "command": [
+        "<BENCHMARK_DIR>/ram_guard_exec.py",
+        "--serve",
+        "--model",
+        "<ASSETS_DIR>/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "--max-context",
+        "512",
+        "--chunk",
+        "128",
+        "--no-warmup",
+        "--cpu-threads",
+        "8",
+        "--hybrid-rows",
+        "16",
+        "--expert-placement",
+        "partitioned",
+        "--resident-budget-gib",
+        "16",
+        "--expert-slots",
+        "64",
+        "--three-level"
+      ],
+      "pid": 117105,
+      "environment": {
+        "STRATA_Q36_KEEP_PACKED": "1",
+        "STRATA_NO_PRESET": "1",
+        "STRATA_IO_PREFETCH": "1",
+        "STRATA_IO_PF_THREADS": "2",
+        "STRATA_IO_STATS": "1",
+        "BENCH_ENGINE_BINARY": "<STRATA_ROOT>/build-three-level/strata-q36",
+        "BENCH_MEMORY_GUARD_LOG": "<BENCHMARK_DIR>/q36-router-stride-fix/fatal-latch-final/injected.guard.json",
+        "STRATA_Q36_WINDOW_CHECK": "4"
+      },
+      "queued_commands": [
+        "GEN 6 198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,198,248045,846,198,7734,264,12654,709,421,27245,40922,494,264,1103,1345,45328,279,1906,314,279,1118,30520,13,79091,1141,854,22373,13,198,248046,198,248045,74455,198,248068,271,248069,271",
+        "GEN 1 198"
+      ],
+      "lines": [
+        "PP 63 63 1450 43.4",
+        "T 71093",
+        "ERR injected expert exchange failure after GPU upload"
+      ],
+      "stdin_open_until_process_exit": true,
+      "exit_code": 1,
+      "guard": {
+        "engine_pgid": 117105,
+        "engine_pid": 117105,
+        "finished_unix": 1793619843.802857,
+        "guard_kind": "soft_watchdog",
+        "guardian_pid": 117107,
+        "hard_cap": false,
+        "limits": {
+          "min_available_bytes": 8589934592,
+          "poll_ms": 50,
+          "rss_bytes": 51539607552
+        },
+        "peaks": {
+          "hwm_bytes": 36295057408,
+          "rss_bytes": 36295057408,
+          "swap_bytes": 0
+        },
+        "samples": 338,
+        "started_unix": 1793619826.732258,
+        "status": "stopped",
+        "system": {
+          "min_available_bytes": 43468603392,
+          "pswpout_delta_pages": 0,
+          "pswpout_end_pages": 92,
+          "pswpout_start_pages": 92
+        },
+        "target_ram_bytes": 53687091200,
+        "termination": {
+          "reason": "engine_zombie",
+          "signal_sent": null
+        }
+      }
+    },
+    "normal": {
+      "command": [
+        "<BENCHMARK_DIR>/ram_guard_exec.py",
+        "--serve",
+        "--model",
+        "<ASSETS_DIR>/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "--max-context",
+        "512",
+        "--chunk",
+        "128",
+        "--no-warmup",
+        "--cpu-threads",
+        "8",
+        "--hybrid-rows",
+        "16",
+        "--expert-placement",
+        "partitioned",
+        "--resident-budget-gib",
+        "32",
+        "--three-level",
+        "--three-level-depth",
+        "3",
+        "--three-level-loops",
+        "6",
+        "--preverify-top-h",
+        "4"
+      ],
+      "pid": 117128,
+      "requests": [
+        {
+          "task_id": "gsm8k/test/3",
+          "tokens": [
+            1206,
+            7995,
+            279,
+            2702
+          ],
+          "lines": [
+            "PP 47 47 75 628.4",
+            "T 1206",
+            "T 7995",
+            "T 279",
+            "T 2702",
+            "DONE 4 47 74.8 16.8 length 2 2 0 0 0 0 0 0.0 47 0"
+          ],
+          "exact_saved_ar_tokens": true
+        },
+        {
+          "task_id": "gsm8k/test/4",
+          "tokens": [
+            1206,
+            7995,
+            1204,
+            1599
+          ],
+          "lines": [
+            "PP 123 123 25 4825.8",
+            "T 1206",
+            "T 7995",
+            "T 1204",
+            "T 1599",
+            "DONE 4 123 25.5 12.5 length 2 2 0 0 0 0 0 0.0 123 0"
+          ],
+          "exact_saved_ar_tokens": true
+        }
+      ],
+      "exit_code": 0,
+      "guard": {
+        "engine_pgid": 117128,
+        "engine_pid": 117128,
+        "finished_unix": 1793619852.8270993,
+        "guard_kind": "soft_watchdog",
+        "guardian_pid": 117130,
+        "hard_cap": false,
+        "limits": {
+          "min_available_bytes": 8589934592,
+          "poll_ms": 50,
+          "rss_bytes": 51539607552
+        },
+        "peaks": {
+          "hwm_bytes": 25032671232,
+          "rss_bytes": 25032671232,
+          "swap_bytes": 0
+        },
+        "samples": 174,
+        "started_unix": 1793619844.0617728,
+        "status": "stopped",
+        "system": {
+          "min_available_bytes": 60041441280,
+          "pswpout_delta_pages": 0,
+          "pswpout_end_pages": 92,
+          "pswpout_start_pages": 92
+        },
+        "target_ram_bytes": 53687091200,
+        "termination": {
+          "reason": "engine_zombie",
+          "signal_sent": null
+        }
+      }
+    }
+  }
+}

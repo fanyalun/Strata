@@ -268,7 +268,7 @@ void check_all() {
     // Activations for up to 8 tokens, device copies with and without the fp32 scales.
     std::vector<uint8_t> x;
     std::vector<float> xs;
-    fill_x(x, xs, 8, rng);
+    fill_x(x, xs, k::kSequenceVerifyMaxT, rng);
     uint8_t* d_x = dalloc<uint8_t>(x.size());
     float* d_xs = dalloc<float>(xs.size());
     up(d_x, x);
@@ -366,16 +366,17 @@ void check_all() {
         reference("moe_hit_grouped_s2_multi (4 tokens, 29 hits)", r, s, ent, x, &xs);
     }
 
-    // ---- 4. moe_grouped_s2: 8 tokens x 10 entries in groups of 1..8, one group on a mapped host blob
-    {
-        const int T = 8, n = T * K;
+    // ---- 4. grouped windows, including a full-window group and one mapped host blob
+    for (const int T : {1, 4, 8, 9, 16, 17, 24, 25}) {
+        if (T > k::kSequenceVerifyMaxT) continue;
+        const int n = T * K;
         uint8_t* h_host = nullptr;
         uint8_t* d_host = nullptr;
         ck(cudaHostAlloc((void**) &h_host, BLOB, cudaHostAllocMapped), "host blob");
         std::memcpy(h_host, fx.hb(fx.nb - 1), BLOB);
         ck(cudaHostGetDevicePointer((void**) &d_host, h_host, 0), "host blob ptr");
         // group sizes: 8, 1, 5, 2, 7, 3, 1, 6, 4, ... up to n entries
-        const int sizes[] = {8, 1, 5, 2, 7, 3, 1, 6, 4, 8, 1, 2, 3, 4, 5, 6, 7, 1, 1, 5};
+        const int sizes[] = {T, 1, 5, 2, 7, 3, 1, 6, 4, T, 1, 2, 3, 4, 5, 6, 7, 1, 1, 5};
         std::vector<int32_t> order(n);   // the output rows, in group order
         std::iota(order.begin(), order.end(), 0);
         std::shuffle(order.begin(), order.end(), rng);
@@ -384,7 +385,7 @@ void check_all() {
         std::vector<Entry> ent;
         int at = 0, gi = 0;
         while (at < n) {
-            const int sz = std::min(sizes[gi % 20], n - at);
+            const int sz = std::min(std::min(sizes[gi % 20], T), n - at);
             const bool host = gi == 3;
             const int b = gi % (fx.nb - 1);
             gptr.push_back((unsigned long long) (host ? d_host : fx.d + (size_t) b * BLOB));
@@ -413,11 +414,11 @@ void check_all() {
         float* d_out = dalloc<float>((size_t) n * H);
         for (int scaled = 1; scaled >= 0; --scaled) {
             Run r;
-            const std::string name = std::string("moe_grouped_s2 (") + std::to_string(n_groups) + " groups" +
+            const std::string name = std::string("moe_grouped_s2 (") + std::to_string(n_groups) + " groups, T=" + std::to_string(T) +
                                      (scaled ? ", fp32 scales)" : ", fp16 d)");
             twice(name.c_str(), d_out, (size_t) n * H, s, [&] {
-                k::moe_grouped_s2(d_gptr, d_gstart, d_ng, d_edst, d_etok, cap_groups, n, d_x, scaled ? d_xs : nullptr,
-                                  s.p, d_out, nullptr);
+                k::moe_grouped_s2_window(d_gptr, d_gstart, d_ng, d_edst, d_etok, cap_groups, n, d_x, scaled ? d_xs : nullptr,
+                                         s.p, d_out, nullptr, T);
             }, &r);
             reference(name.c_str(), r, s, ent, x, scaled ? &xs : nullptr);
         }

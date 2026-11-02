@@ -1080,6 +1080,7 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
         case 5: gdn_conv_ab_kernel<5, true><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 6: gdn_conv_ab_kernel<6, true><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 7: case 8: gdn_conv_ab_kernel<kVerifyNarrowT, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: gdn_conv_ab_kernel<16, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         default: gdn_conv_ab_kernel<kVerifyMaxT, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_conv_ab_multi");
@@ -1130,6 +1131,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         case 5: gdn_ab_multi_kernel<5, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 6: gdn_ab_multi_kernel<6, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 7: case 8: gdn_ab_multi_kernel<kVerifyNarrowT, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: gdn_ab_multi_kernel<16, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         default: gdn_ab_multi_kernel<kVerifyMaxT, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_ab_multi");
@@ -1174,8 +1176,11 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
         const dim3 grid((unsigned) h_v, S / GS_COLS), block(GS_COLS, RG);
         if (t_out_begin >= n_tok) {   // no outputs (the commit): the state only
-            if (n_tok > kVerifyNarrowT)
+            if (n_tok > 16)
                 gdn_state_replay_kernel<kVerifyMaxT><<<grid, block, 0, (cudaStream_t) stream>>>(
+                    state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
+            else if (n_tok > kVerifyNarrowT)
+                gdn_state_replay_kernel<16><<<grid, block, 0, (cudaStream_t) stream>>>(
                     state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
             else
                 gdn_state_replay_kernel<kVerifyNarrowT><<<grid, block, 0, (cudaStream_t) stream>>>(

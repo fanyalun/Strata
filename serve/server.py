@@ -1017,6 +1017,7 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+        self.three_level = "--three-level" in args
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -3242,6 +3243,64 @@ def drafting_card_class() -> str:
     return _CARD_CLASS[0]
 
 
+def check_three_level_config(cfg: dict, args: list[str]) -> None:
+    if "--three-level" not in args:
+        return
+    values = {"--three-level-depth": 3, "--three-level-loops": 6, "--preverify-top-h": 4}
+    for i, flag in enumerate(args):
+        if flag in values:
+            if i + 1 >= len(args) or not re.fullmatch(r"-?\d+", str(args[i + 1])):
+                raise ValueError(f"three-level: {flag} requires an integer")
+            values[flag] = int(args[i + 1])
+    depth, loops, top_h = values.values()
+    if depth < 1 or loops < 1 or (depth + 1) * loops > 24:
+        raise ValueError("three-level: depth and loops must be positive and (depth + 1) * loops must be <= 24")
+    router_k = 8 if cfg.get("arch") == "qwen35moe" or "--model" in args else 10
+    if not 1 <= top_h <= router_k:
+        raise ValueError(f"three-level: preverify-top-h must be in 1..{router_k}")
+    if draft_layer.is_off(cfg) or cfg.get("drafting") in ("off", "dflash2"):
+        raise ValueError("three-level requires MTP; it conflicts with the configured drafter")
+    for i, flag in enumerate(args):
+        if flag == "--mtp" and (i + 1 == len(args) or args[i + 1] in ("0", "off", "false")):
+            raise ValueError("three-level requires MTP; --mtp cannot be off")
+    if cfg.get("backend") not in (None, "cuda"):
+        raise ValueError("three-level requires the CUDA backend")
+    if cfg.get("arch") not in (None, "qwen35moe", "qwen4exp"):
+        raise ValueError("three-level supports Qwen3.6 and Qwen3.8 only")
+    if (len(gpu_list(cfg)) > 1 or cfg.get("replicas") or cfg.get("split_serve")
+            or any(f in args for f in ("--layer-split", "--peer-device"))):
+        raise ValueError("three-level requires a single GPU")
+    if (cfg.get("parallel", 1) not in (None, False, 1)
+            or any(f in args for f in ("--batch", "--slots", "--batch-mtp"))):
+        raise ValueError("three-level requires one request at a time; remove batch/parallel settings")
+    if isinstance(cfg.get("vision"), dict) or cfg.get("vision") or "--vision" in args:
+        raise ValueError("three-level supports text input only")
+    if cfg.get("reasoning_loop_recovery") in (True, "recover"):
+        raise ValueError("three-level cannot use reasoning_loop_recovery=recover; it changes sampling")
+    budget = cfg.get("reasoning_budget_tokens") or 0
+    if cfg.get("reasoning_close_retry") or not isinstance(budget, (int, float)) or budget > 0:
+        raise ValueError("three-level cannot insert a forced reasoning ending")
+    check_three_level_sampling(dict(cfg.get("sampling") or {}))
+
+
+def check_three_level_sampling(sampling: dict) -> None:
+    check_request_sampling(sampling)
+    for name, neutral in (("temperature", 0), ("presence_penalty", 0), ("frequency_penalty", 0),
+                          ("repetition_penalty", 1)):
+        value = sampling.get(name)
+        if value is not None and value != neutral:
+            raise ValueError(f"{name}: three-level requires {neutral} (greedy without penalties)")
+    for name in ("logit_bias", "allowed_token_ids", "logprobs", "top_logprobs"):
+        if sampling.get(name):
+            raise ValueError(f"{name}: unsupported in three-level mode")
+    if sampling.get("n", 1) not in (None, 1):
+        raise ValueError("n: three-level supports one completion per request")
+    for name in ("reasoning_budget_tokens", "thinking_budget_tokens"):
+        value = sampling.get(name)
+        if value is not None and (not isinstance(value, (int, float)) or value > 0):
+            raise ValueError(f"{name}: three-level cannot insert a forced reasoning ending")
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3251,9 +3310,10 @@ def engine_args(cfg: dict) -> list[str]:
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
     if cfg.get("user_args"):
         args = user_args.merge(args, cfg["user_args"])
+    check_three_level_config(cfg, args)
     # "drafting": auto | mtp | dflash2 | off (strata_control/drafting.py; the Models screen and `strata launch --drafting` write it): which drafter
     # guesses ahead. A choice that cannot be applied starts the MTP and says why in the engine's /metrics ("drafting_note").
-    if cfg.get("drafting") is not None or drafting.suggest(drafting_card_class()) != "mtp":
+    if "--three-level" not in args and (cfg.get("drafting") is not None or drafting.suggest(drafting_card_class()) != "mtp"):
         shaped = {**cfg, "args": args}
         decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args))
         args = shaped["args"]
@@ -4833,7 +4893,10 @@ class Service:
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
+        cleaned = clean_shared_defaults(defaults)
+        if getattr(self.engine, "three_level", False):
+            check_three_level_sampling(cleaned)
+        self.shared = cleaned
         if self.shared_path:
             try:
                 if self.shared:
@@ -5187,6 +5250,12 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if getattr(self.engine, "three_level", False):
+            self.sampling_for(kwargs.get("enable_thinking", True), req)
+            if force:
+                raise ValueError("three-level cannot insert a forced tool-call opening")
+            if images_of(messages):
+                raise ValueError("three-level supports text input only")
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -5470,19 +5539,29 @@ class Service:
             if ka is not None:
                 ka.release()
 
+    def sampling_for(self, thinking, sampling=None):
+        three_level = getattr(self.engine, "three_level", False)
+        card = {"temperature": 0} if three_level else model_card_sampling(self.model_arch, thinking)
+        defaults = {**card, **self.sampling_defaults, **self.shared}
+        if not defaults:
+            return sampling
+        values = {k: v for k, v in (sampling or {}).items() if v is not None}
+        merged = {**defaults, **values}
+        if three_level:
+            check_three_level_sampling(merged)
+        return merged
+
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
-            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
-            sampling = {**defaults, **req_values}
+        sampling = self.sampling_for(thinking, sampling)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
-        if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
+        if (thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP
+                and not getattr(self.engine, "three_level", False)):
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
             # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
@@ -5794,7 +5873,8 @@ class Service:
                                   "reads its prompt from the start", flush=True)
                             finish = "length"
                             break
-                        if recover_prompt is not None and not cancel.is_set() and n < max_new:
+                        if (recover_prompt is not None and not cancel.is_set() and n < max_new
+                                and not getattr(self.engine, "three_level", False)):
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at
                             # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
@@ -7635,7 +7715,7 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
+            defaults = svc.sampling_for(True) or {}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -9187,6 +9267,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if not cfg:
             ap.error("--engine strata needs --config")
         cfg = with_component_engine(cfg)
+        resolved_args = user_args.merge(list(cfg["args"]), cfg["user_args"]) if cfg.get("user_args") else list(cfg["args"])
+        try:
+            check_three_level_config(cfg, resolved_args)
+        except ValueError as e:
+            ap.error(str(e))
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
         # missing shard or a plugin would break the promise the flag makes.

@@ -1,0 +1,24 @@
+Internal ctest changing into directory: <STRATA_ROOT>/build-three-level
+Test project <STRATA_ROOT>/build-three-level
+    Start  40: mmvq_multi_parity
+1/9 Test  #40: mmvq_multi_parity ................   Passed    0.74 sec
+    Start  60: mmvf_rows_parity
+2/9 Test  #60: mmvf_rows_parity .................   Passed    3.22 sec
+    Start  63: verify_parity
+3/9 Test  #63: verify_parity ....................   Passed    0.30 sec
+    Start  65: gdn_parity
+4/9 Test  #65: gdn_parity .......................   Passed    1.29 sec
+    Start  66: gdn_parity_split
+5/9 Test  #66: gdn_parity_split .................   Passed    0.77 sec
+    Start  67: gdn_chunk_parity
+6/9 Test  #67: gdn_chunk_parity .................   Passed    3.34 sec
+    Start  98: kv_window_parity
+7/9 Test  #98: kv_window_parity .................   Passed    4.64 sec
+    Start 104: s2_expert_grouped_parity
+8/9 Test #104: s2_expert_grouped_parity .........   Passed    0.79 sec
+    Start 128: window_limits_test
+9/9 Test #128: window_limits_test ...............   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 9
+
+Total Test time (real) =  15.10 sec

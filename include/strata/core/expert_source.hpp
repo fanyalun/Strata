@@ -25,6 +25,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/three_level.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <algorithm>
@@ -376,6 +377,7 @@ private:
 /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
 /// blob is a VRAM slot or a pinned host blob read over PCIe.
 struct GpuPlanSink {
+    const uint8_t* active_routes = nullptr;
     int32_t* counts = nullptr;             ///< [0] groups, [1] entries
     int32_t* start = nullptr;              ///< cap + 1
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
@@ -494,6 +496,10 @@ struct PcieModel {
 struct ForesightSwap;
 
 struct ExpertDispatch {
+    const uint8_t* active_routes = nullptr;
+    bool record_usage = true;
+    bool learn_foresight = true;
+    int64_t pruned_entries = 0;
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
@@ -684,6 +690,9 @@ void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
 
+/// New speculative modes defer learning until Full Verify has committed its retained input rows.
+void expert_dispatch_observe_accepted(ExpertDispatch& d, int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k);
+
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
 /// expert caches.  Returns immediately when there are no hits, which is every layer until the cache is warm.
@@ -725,6 +734,10 @@ public:
     /// it is asked for: the SSD tier, read in place through the OS file cache, with no 30-77 GB experts.bin copy.
     /// With experts.bin present nothing changes.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// Own a layout snapshot, including the GGUF role ranges, independently of the process-wide pack layout.
+    bool open(const std::string& pack_dir, const strata::kernels::cpu::ExpertLayout& layout, std::string& err);
+    /// Read these GGUF ranges even when an unrelated experts.bin exists beside the model.
+    bool open_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& layout, std::string& err);
     /// CS-T: the --native shard (native_experts.txt names the other files beside it); see `open`.
     void set_gguf(const std::string& native) { gguf_ = native; }
     /// STRATA_NUMA_SPLIT: files the engine read at start outside this source (the pack's dense.bin, the MTP head),
@@ -758,6 +771,10 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    /// A dispatcher with its own GPU slots supplies the published primary partition. No prompt-loan duplicates.
+    bool pin_partition(const std::vector<std::pair<int32_t, int32_t>>& gpu_pairs, std::string& err,
+                       uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>& rank,
+                       bool pin = true, uint64_t headroom_bytes = 8ull << 30);
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -939,6 +956,11 @@ public:
     /// 149-prefetch: the scheduled read-ahead (STRATA_IO_PF_SCHED=1 with STRATA_IO_PREFETCH=1): admission by confidence
     /// against the queue's pressure, a speculative byte budget per decode window, a deadline per read.
     void warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) override;
+    void speculative_begin(uint64_t window_id);
+    void speculative_stage(SpeculativeStage stage);
+    void speculative_hint(int64_t layer, const int32_t* ids, int64_t n_rows, int64_t k, int64_t retained_rows,
+                          const int32_t* gpu_ready_slots = nullptr);
+    void speculative_end();
     bool io_sched() const { return io_sched_; }
     bool wants_scores() const override { return io_sched_ && io_pf_; }
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
@@ -990,6 +1012,15 @@ public:
     IoCounters io_counters() const;
 
 private:
+    std::shared_ptr<const strata::kernels::cpu::ExpertLayout> layout_;
+    bool open_layout(const std::string& pack_dir, const strata::kernels::cpu::ExpertLayout& layout,
+                     bool gguf_only, std::string& err);
+    bool pin_complement(const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
+                        const std::vector<int32_t>& pair_slot, const std::vector<uint64_t>& slot_bytes,
+                        const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
+                        int64_t lend_from_slot, std::string& err, bool pin, uint64_t headroom_bytes,
+                        uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+                        bool allow_empty = false);
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
@@ -1159,8 +1190,10 @@ private:
     std::condition_variable io_cv_;
     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
     bool io_quit_ = false;
+    bool io_draining_ = false;
+    size_t io_active_ = 0;
     // ---- 149-prefetch: the scheduled read-ahead (STRATA_IO_PF_SCHED=1)
-    struct IoJob { int32_t layer, expert; float conf; uint64_t deadline; uint64_t bytes; };
+    struct IoJob { int32_t layer, expert; float conf; uint64_t deadline; uint64_t bytes; uint64_t window = 0; };
     bool io_sched_ = false;
     float io_minconf_ = 0.5f;                          ///< STRATA_IO_PF_MINCONF: the bar with an empty queue
     uint64_t io_budget_fixed_ = 0;                     ///< STRATA_IO_PF_BUDGET_MB (0: auto from the measured rates)
@@ -1176,11 +1209,15 @@ private:
     uint64_t io_prev_pf_ = 0, io_prev_used_ = 0;       ///< (under io_mu_) the counters at the last window tick
     double io_target_ = 0.5;                          ///< STRATA_IO_PF_TARGET: the used share the feedback aims at (0: no feedback)
     std::atomic<uint64_t> io_epoch_{0};                ///< the decode's layer clock (begin_layer), read by the workers
+    std::atomic<bool> speculative_active_{false};
+    std::atomic<SpeculativeStage> speculative_stage_{SpeculativeStage::PreVerify};
+    std::atomic<uint64_t> speculative_window_{0}, speculative_full_base_{0};
     std::unique_ptr<std::atomic<uint8_t>[]> pf_mark_;  ///< per (layer, expert): read ahead, not yet asked for (fill mode)
     std::atomic<uint64_t> io_pf_bytes_{0}, io_pf_used_bytes_{0}, io_pf_late_{0}, io_pf_rej_conf_{0}, io_pf_rej_budget_{0};
     uint64_t io_budget_now() const;                    ///< (io_mu_ held) the per-window budget in bytes
     void io_window_tick();                             ///< begin_layer: a new decode window starts at layer 0
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+    std::vector<uint64_t> stage_window_, stage_consume_;
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},

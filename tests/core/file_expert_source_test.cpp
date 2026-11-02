@@ -2,6 +2,7 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "gguf_fixture.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -252,6 +253,44 @@ void test_native_variable_layout() {
     require(opened, "source failed to reopen after size errors: " + err);
     const uint8_t* reopened = source.blob(1, 0);
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
+    source.close();
+
+    NativeFmt q36;
+    require(native_fmt(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 2048, 512, q36, err), err);
+    ExpertLayout explicit_layout;
+    explicit_layout.native = true;
+    explicit_layout.n_layers = 2;
+    explicit_layout.n_expert = experts;
+    explicit_layout.fmt = {q36, q36};
+    explicit_layout.bytes = {(uint64_t) q36.bytes, (uint64_t) q36.bytes};
+    explicit_layout.offset = {0, (uint64_t) q36.bytes * experts};
+    explicit_layout.total = 2 * (uint64_t) q36.bytes * experts;
+    explicit_layout.max_blob = q36.bytes;
+    TempDirectory gguf_dir;
+    const auto gguf_path = gguf_dir.path / "q36.gguf";
+    const auto written = fixture::write(gguf_path, {}, {
+        {"blk.0.ffn_gate_exps.weight", {2048, 512, experts}, GGML_TYPE_Q4_K, 1},
+        {"blk.0.ffn_up_exps.weight", {2048, 512, experts}, GGML_TYPE_Q4_K, 2},
+        {"blk.0.ffn_down_exps.weight", {512, 2048, experts}, GGML_TYPE_Q5_1, 3},
+        {"blk.1.ffn_gate_exps.weight", {2048, 512, experts}, GGML_TYPE_Q4_K, 4},
+        {"blk.1.ffn_up_exps.weight", {2048, 512, experts}, GGML_TYPE_Q4_K, 5},
+        {"blk.1.ffn_down_exps.weight", {512, 2048, experts}, GGML_TYPE_Q5_1, 6},
+    });
+    for (const auto at : written.offsets) explicit_layout.gguf_off.push_back(written.data_start + at);
+    create_pack(gguf_dir.path, explicit_layout.total, {{0, 'x'}});
+    require(source.open_gguf(gguf_path.string(), explicit_layout, err), err);
+    explicit_layout.gguf_off.clear();
+    explicit_layout.fmt.clear();
+    std::vector<uint8_t> assembled(q36.bytes);
+    require(source.copy_blob(1, 2, assembled.data()), "explicit GGUF layout could not assemble an expert");
+    const size_t role_at[] = {0, (size_t) q36.up_off, (size_t) q36.down_off, (size_t) q36.bytes};
+    for (int r = 0; r < 3; ++r) {
+        bool exact = true;
+        const size_t per = role_at[r + 1] - role_at[r];
+        for (size_t i = 0; i < per; ++i)
+            exact &= assembled[role_at[r] + i] == fixture::pattern((uint8_t) (4 + r), 2 * per + i);
+        require(exact, "explicit layout used the global Flash-Next layout or lost its owned role ranges");
+    }
     source.close();
 }
 #endif
@@ -789,7 +828,10 @@ void test_rotating_source(bool rotate, bool pin) {
     }
     const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
     // Keep expert 4 on the file tier to check that the fallback survives rotation.
-    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(rotate ? src.pin_partition({{0,2},{0,3}}, err, 2 * bytes, rank, pin, 0)
+                   : src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.resident_bytes() == 2 * bytes && !src.has_resident(0, 2) && !src.has_resident(0, 3) &&
+                !src.has_resident(0, 4), "the partition duplicated GPU experts or exceeded the RAM budget");
     require(src.reserve_exchanges(2, err), err);
     require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
     require(src.reserve_exchanges(1, err), "smaller capacity rejected");
@@ -843,6 +885,10 @@ void test_rotating_source(bool rotate, bool pin) {
     require(!src.exchange_rotation() && !src.exchange_buffer(0), "close retained storage");
     require(src.open(dir.path.string(), 1, 5, err), err);
     require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
+    require(src.pin_partition({{0,0},{0,1},{0,2},{0,3},{0,4}}, err, FileExpertSource::kResidentWhatFits,
+                              rank, pin, 0), err);
+    require(src.complement_ready() && src.resident_bytes() == 0 && !src.has_resident(0, 0),
+            "an all-GPU partition must keep an empty CPU complement");
 }
 
 // #2134: a Foresight slot copied from an expert's RAM place before an exchange rewrote that place is never served; the
@@ -897,6 +943,35 @@ void test_foresight_exchange(bool two_phase) {
     };
     fs.note_miss(&src, 0, 0);                                    // expert 0 -> the slot, from its RAM place
     require(landed(0) && fs.verify_ok == 1, "the first copy did not land");
+    std::vector<int32_t> ready;
+    fs.slot[0].ready = false;
+    fs.slot[0].loading = true;
+    fs.slot[0].issued.store(false, std::memory_order_release);
+    require(fs.begin_window(ready, err) && ready.size() == 5 && ready[0] < 0,
+            "a pending Foresight copy appeared in the frozen ready view");
+    fs.slot[0].issued.store(true, std::memory_order_release);
+    require(!fs.take(0, 0, ptr), "a pending copy became a hit inside the outer window");
+    fs.end_window();
+    require(landed(0) && fs.verify_ok == 2, "the next outer window could not see a completed copy");
+    const uint64_t before_freeze = fs.copies, last_ref = fs.slot[0].last_ref;
+    fs.completed.fetch_add(8);
+    require(fs.begin_window(ready, err) && ready[0] >= 0 && ready[1] < 0,
+            "the frozen view omitted a ready Foresight slot");
+    require(fs.take(0, 0, ptr) && fs.slot[0].last_ref == last_ref,
+            "a private Foresight hit changed its long-term eviction age");
+    fs.note_miss(&src, 0, 1);
+    fs.predict(&src, 0, 1);
+    require(fs.copies == before_freeze, "a frozen Foresight slot was refilled during speculative verification");
+    fs.end_window();
+    ExpertDispatch accepted;
+    accepted.fs = &fs;
+    accepted.src = &src;
+    accepted.n_expert = 5;
+    const int32_t accepted_ids[] = {1, 0};
+    expert_dispatch_observe_accepted(accepted, 0, accepted_ids, 1, 2);
+    require(fs.slot[0].last_ref == fs.completed.load() && fs.copies == before_freeze &&
+                fs.where[0] >= 0 && fs.where[1] < 0,
+            "an accepted Full miss evicted a ready hit before its eviction age was refreshed");
     // the adaptive tier swaps expert 0 into cache slot 0 and evicts expert 2 into the exchange buffer
     uint8_t* eviction = src.exchange_buffer(0);
     const uint8_t* prior = src.blob(0, 0);
@@ -917,7 +992,7 @@ void test_foresight_exchange(bool two_phase) {
     }
     require(fs.dropped == 1, "the exchange did not drop the slot");
     require(!fs.take(0, 0, ptr), "a slot copied before the exchange was served");
-    if (!two_phase) {   // the slot was served at window 0: no refill before window 0 + depth
+    if (!two_phase) {   // the accepted window protects the dropped slot for another depth windows
         const uint64_t c0 = fs.copies, b0 = fs.busy;
         fs.note_miss(&src, 0, 2);
         require(fs.copies == c0 && fs.busy == b0 + 1, "a dropped slot was refilled while a window may still read it");
@@ -929,7 +1004,7 @@ void test_foresight_exchange(bool two_phase) {
     std::vector<uint8_t> back(bytes);
     require(cudaMemcpy(back.data(), (const void*) ptr, bytes, cudaMemcpyDeviceToHost) == cudaSuccess && back == truth[2],
             "the slot does not hold expert 2's bytes");
-    require(fs.verify_bad == 0 && fs.verify_ok == 2, "verify counted a bad slot");
+    require(fs.verify_bad == 0 && fs.verify_ok == 3, "verify counted a bad slot");
     src.set_foresight_swap(nullptr);
     std::cout << "foresight exchange (" << (two_phase ? "commit_copies + commit_flip" : "commit_exchanges")
               << "): dropped " << fs.dropped << ", " << fs.report() << ": PASS\n";

@@ -75,6 +75,9 @@ struct ForesightSwap {
 
     /// The pool, for a routed expert that is not in the cache: true and its device address when a landed slot holds it.
     bool take(int64_t layer, int32_t expert, unsigned long long& ptr);
+    /// Publish one ready-only view for an outer speculative window; pending copies stay misses until the next one.
+    bool begin_window(std::vector<int32_t>& ready_slots, std::string& err);
+    void end_window();
     /// The pool, for an expert the CPU computes now: maybe copy it into a slot of its layer for the next windows.
     void note_miss(ExpertSource* src, int64_t layer, int32_t expert);
     /// The router look-ahead (any thread), for an expert the next layer's router predicts and no cache holds: maybe copy
@@ -91,8 +94,11 @@ struct ForesightSwap {
     std::string report() const;
 
 private:
+    bool frozen_ = false;
+    bool ready_locked(int64_t layer, int32_t expert, Slot& sl);
     void request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted);
     std::mutex smu_;                         ///< slot, where, card_* and the counters: the pool thread and the look-ahead thread
+    std::condition_variable window_cv_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<int64_t> queue_;              ///< slot indices whose copy the filler issues

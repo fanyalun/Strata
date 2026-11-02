@@ -1,0 +1,32 @@
+{
+  "engine_pgid": 108962,
+  "engine_pid": 108962,
+  "finished_unix": 1793616185.375849,
+  "guard_kind": "soft_watchdog",
+  "guardian_pid": 108964,
+  "hard_cap": false,
+  "limits": {
+    "min_available_bytes": 8589934592,
+    "poll_ms": 50,
+    "rss_bytes": 51539607552
+  },
+  "peaks": {
+    "hwm_bytes": 28833734656,
+    "rss_bytes": 28684787712,
+    "swap_bytes": 0
+  },
+  "samples": 619,
+  "started_unix": 1793616154.1017487,
+  "status": "stopped",
+  "system": {
+    "min_available_bytes": 48994086912,
+    "pswpout_delta_pages": 0,
+    "pswpout_end_pages": 92,
+    "pswpout_start_pages": 92
+  },
+  "target_ram_bytes": 53687091200,
+  "termination": {
+    "reason": "engine_zombie",
+    "signal_sent": null
+  }
+}

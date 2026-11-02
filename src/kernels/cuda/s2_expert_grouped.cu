@@ -1215,6 +1215,22 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
                     gu_grouped_kernel<GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
                                                                   gate_up, (int) cap_entries);
         }
+        if constexpr (kGroupPasses > 2) {
+            if (max_group > 2 * GMAX) {
+                if (fast) gu_grouped_t_kernel<2 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                    x_q8_0, x_scales, gate_up, (int) cap_entries);
+                else gu_grouped_kernel<2 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                    x_q8_0, x_scales, gate_up, (int) cap_entries);
+            }
+        }
+        if constexpr (kGroupPasses > 3) {
+            if (max_group > 3 * GMAX) {
+                if (fast) gu_grouped_t_kernel<3 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                    x_q8_0, x_scales, gate_up, (int) cap_entries);
+                else gu_grouped_kernel<3 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                    x_q8_0, x_scales, gate_up, (int) cap_entries);
+            }
+        }
         check("moe_grouped_s2/gu", stream);
     }
     // #783 PR-k (stuchapin909): SwiGLU and the scaled Q8_0 quantize of its result in one kernel (gate_up still gets the
@@ -1260,6 +1276,18 @@ static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* gr
             if constexpr (kWide)
                 if (second) down_grouped_kernel<GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
         }
+        if constexpr (kGroupPasses > 2) {
+            if (max_group > 2 * GMAX) {
+                if (fast) down_grouped_t_kernel<2 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+                else down_grouped_kernel<2 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+            }
+        }
+        if constexpr (kGroupPasses > 3) {
+            if (max_group > 3 * GMAX) {
+                if (fast) down_grouped_t_kernel<3 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+                else down_grouped_kernel<3 * GMAX><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+            }
+        }
         check("moe_grouped_s2/down", stream);
     }
 }
@@ -1271,7 +1299,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                     GMAX);
 }
 
-#if STRATA_VERIFY_MAX_T > 8
+#if STRATA_SEQUENCE_VERIFY_MAX_T > 8
 void moe_grouped_s2_wide(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                          const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                          const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,

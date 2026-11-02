@@ -42,6 +42,7 @@ class ModelCardSampling(unittest.TestCase):
         cls.httpd.server_close()
 
     def setUp(self):
+        self.engine.three_level = False
         self.svc.model_arch = "qwen4exp"
         self.svc.sampling_defaults = {}
         self.svc.shared = {}
@@ -49,6 +50,7 @@ class ModelCardSampling(unittest.TestCase):
 
     def tearDown(self):
         self.svc.model_arch = None
+        self.engine.three_level = False
 
     def keys(self, **body):
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, **body}
@@ -102,6 +104,55 @@ class ModelCardSampling(unittest.TestCase):
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")
+
+    def test_three_level_defaults_stay_greedy_and_reject_sampling_before_streaming(self):
+        self.engine.three_level = True
+        for arch in ("qwen4exp", "qwen35moe"):
+            self.svc.model_arch = arch
+            for thinking in ("none", "high"):
+                with self.subTest(arch=arch, thinking=thinking):
+                    self.assertEqual(self.keys(reasoning_effort=thinking), "")
+        for params in ({"temperature": 0.7}, {"presence_penalty": 1.5}, {"repeat_penalty": 1.1},
+                       {"frequency_penalty": 0.2}, {"logprobs": True}, {"n": 2},
+                       {"reasoning_budget_tokens": 4}, {"thinking_budget_tokens": 4}):
+            with self.subTest(params=params), self.assertRaises(urllib.error.HTTPError) as caught:
+                self.keys(stream=True, **params)
+            self.assertEqual(caught.exception.code, 400)
+            self.assertIn("three-level", caught.exception.read().decode())
+            self.assertEqual(self.engine.sampling, {})
+        self.svc.shared = {"temperature": 0.8}
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.keys()
+        self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(self.keys(temperature=0), "")
+        with self.assertRaisesRegex(ValueError, "three-level"):
+            self.svc.set_shared({"temperature": 0.5})
+        self.assertEqual(self.svc.set_shared({"temperature": 0}), {"temperature": 0})
+
+    def test_three_level_rejects_tool_images_before_omitting_unreadable_images(self):
+        self.engine.three_level = True
+        messages = [{"role": "tool", "tool_call_id": "x", "content": [
+            {"type": "image_url", "image_url": {"url": "https://invalid.example/image.png"}}]}]
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.keys(messages=messages, stream=True)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("three-level", caught.exception.read().decode())
+        self.assertEqual(self.engine.sampling, {})
+
+    def test_three_level_sampling_rejection_is_shared_by_all_http_apis(self):
+        self.engine.three_level = True
+        messages = [{"role": "user", "content": "hi"}]
+        for path, body in (("/v1/chat/completions", {"messages": messages, "max_tokens": 8}),
+                           ("/v1/messages", {"messages": messages, "max_tokens": 8}),
+                           ("/v1/responses", {"input": "hi", "max_output_tokens": 8})):
+            with self.subTest(path=path):
+                req = urllib.request.Request(self.base + path,
+                    data=json.dumps({**body, "model": "m", "temperature": 0.7, "stream": True}).encode(),
+                    headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(req, timeout=10)
+                self.assertEqual(caught.exception.code, 400)
+                self.assertIn("three-level", caught.exception.read().decode())
 
 
 if __name__ == "__main__":

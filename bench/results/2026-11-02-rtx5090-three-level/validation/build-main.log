@@ -1,0 +1,40 @@
+[1/4] Building CUDA object CMakeFiles/strata_qwen35.dir/src/qwen35/q36_engine.cu.o
+<STRATA_ROOT>/include/strata/core/expert_source.hpp(719): warning #611-D: overloaded virtual function "strata::core::ExpertSource::prefetch" is only partially overridden in class "strata::core::FileExpertSource"
+  class FileExpertSource : public ExpertSource {
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+<STRATA_ROOT>/include/strata/core/expert_source.hpp(1298): warning #611-D: overloaded virtual function "strata::core::ExpertSource::prefetch" is only partially overridden in class "strata::core::ArenaExpertSource"
+  class ArenaExpertSource : public ExpertSource {
+        ^
+
+<STRATA_ROOT>/include/strata/core/expert_source.hpp(719): warning #611-D: overloaded virtual function "strata::core::ExpertSource::prefetch" is only partially overridden in class "strata::core::FileExpertSource"
+  class FileExpertSource : public ExpertSource {
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+<STRATA_ROOT>/include/strata/core/expert_source.hpp(1298): warning #611-D: overloaded virtual function "strata::core::ExpertSource::prefetch" is only partially overridden in class "strata::core::ArenaExpertSource"
+  class ArenaExpertSource : public ExpertSource {
+        ^
+
+<STRATA_ROOT>/src/qwen35/q36_engine.cu(1713): warning #550-D: variable "v" was set but never used
+                      float v[32], t[32];
+                            ^
+
+<STRATA_ROOT>/src/qwen35/q36_engine.cu(1950): warning #177-D: variable "D" was declared but never referenced
+          const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
+                                                                        ^
+
+<STRATA_ROOT>/src/qwen35/q36_engine.cu(206): warning #177-D: function "<unnamed>::k_add" was declared but never referenced
+            void k_add(float* x, const float* y, int64_t n) {
+                 ^
+
+<STRATA_ROOT>/src/qwen35/q36_engine.cu(240): warning #177-D: function "<unnamed>::k_gate_rows" was declared but never referenced
+            void k_gate_rows(float* sh, const float* gate, int n, int T) {
+                 ^
+
+[2/4] Linking CXX static library libstrata_qwen35.a
+[3/4] Linking CXX executable strata-q36
+[4/4] Linking CXX executable strata

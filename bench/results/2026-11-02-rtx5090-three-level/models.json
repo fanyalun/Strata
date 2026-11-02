@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "bytes": 22853663008,
+      "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
+      "repo": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
+      "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+    },
+    {
+      "bytes": 39225954592,
+      "sha256": "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
+    },
+    {
+      "bytes": 28800138432,
+      "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf"
+    },
+    {
+      "bytes": 1538035200,
+      "sha256": "d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13",
+      "file": "pack-iq2_xs/dense.bin"
+    },
+    {
+      "bytes": 707788800,
+      "sha256": "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f",
+      "file": "mtp-rt/experts.bin"
+    },
+    {
+      "bytes": 116099072,
+      "sha256": "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a",
+      "file": "mtp-rt/dense.bin"
+    }
+  ],
+  "mtp_source": {
+    "repository": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "tensor_ranges": 31
+  },
+  "model_weights_not_bundled": true
+}

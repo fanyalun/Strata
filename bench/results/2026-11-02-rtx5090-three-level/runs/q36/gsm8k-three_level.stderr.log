@@ -1,0 +1,18 @@
+strata-q36: <ASSETS_DIR>/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf: 753 tensors (layout checked), 4.40 GiB on the GPU in 2.3 s (the routed experts are placed after the engine's buffers)
+strata: K-quant prompt kernels from <STRATA_ROOT>/build-three-level/libstrata_kq.so (STRATA_MMQ_KQ=1)
+strata-q36: prompt experts on MMQ (int8)
+strata-q36: context 512 cells, prompt chunk 128, MTP block loaded, 24.82 GiB of VRAM free
+strata-q36: every routed expert in VRAM (18.75 GiB) in 19.1 s
+strata-q36: three-level depth 3 loops 6 top-h 4, at most 24 candidates, native capacity 25
+strata serve: session 0: prompt 77 tokens = 0 reused + 77 read in 82 ms (937.0 tok/s), 222 generated in 761 ms (291.7 tok/s), drafts accepted 211 of 211 (stop)
+strata serve: session 0: prompt 38 tokens = 0 reused + 38 read in 15 ms (2533.3 tok/s), 150 generated in 462 ms (324.6 tok/s), drafts accepted 143 of 143 (stop)
+strata serve: session 0: prompt 69 tokens = 0 reused + 69 read in 20 ms (3486.5 tok/s), 256 generated in 859 ms (297.9 tok/s), drafts accepted 242 of 242 (length)
+strata serve: session 0: prompt 47 tokens = 0 reused + 47 read in 16 ms (2965.4 tok/s), 181 generated in 569 ms (318.2 tok/s), drafts accepted 173 of 173 (stop)
+strata serve: session 0: prompt 123 tokens = 0 reused + 123 read in 26 ms (4807.1 tok/s), 256 generated in 845 ms (303.0 tok/s), drafts accepted 243 of 243 (length)
+strata serve: session 0: prompt 67 tokens = 0 reused + 67 read in 19 ms (3445.4 tok/s), 256 generated in 871 ms (293.8 tok/s), drafts accepted 242 of 242 (length)
+strata serve: session 0: prompt 53 tokens = 0 reused + 53 read in 17 ms (3162.3 tok/s), 256 generated in 796 ms (321.7 tok/s), drafts accepted 244 of 244 (length)
+strata serve: session 0: prompt 82 tokens = 0 reused + 82 read in 21 ms (3917.5 tok/s), 256 generated in 820 ms (312.1 tok/s), drafts accepted 243 of 243 (length)
+strata serve: session 0: prompt 116 tokens = 0 reused + 116 read in 25 ms (4700.4 tok/s), 256 generated in 836 ms (306.0 tok/s), drafts accepted 243 of 243 (length)
+strata serve: session 0: prompt 72 tokens = 0 reused + 72 read in 20 ms (3629.9 tok/s), 256 generated in 809 ms (316.6 tok/s), drafts accepted 243 of 243 (length)
+strata serve: session 0: prompt 72 tokens = 0 reused + 72 read in 20 ms (3646.9 tok/s), 256 generated in 828 ms (309.3 tok/s), drafts accepted 243 of 243 (length)
+strata-q36: three-level: 123 windows, 709 Pre-Verify calls, 123 Full Verify calls, largest full window 25 rows; hybrid Pre-Verify routes 0 kept of 0 native

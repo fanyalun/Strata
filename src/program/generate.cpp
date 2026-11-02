@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/three_level.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -534,6 +535,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 }
 
 struct Options {
+    strata::core::ThreeLevelConfig three_level;
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
@@ -665,6 +667,7 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    bool partitioned_experts = false;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -1061,6 +1064,10 @@ void usage() {
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
+                 "  --three-level        CUDA greedy text: Draft, top-h plus ready-GPU Pre-Verify, then native Full Verify\n"
+                 "  --three-level-depth N  MTP drafts per segment (default 3)\n"
+                 "  --three-level-loops N  Pre-Verify segments (default 6; (depth+1)*loops <= 24)\n"
+                 "  --preverify-top-h N   mandatory router ranks in Pre-Verify (default 4)\n"
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
                  "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
@@ -1184,6 +1191,8 @@ void usage() {
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
+                 "  --expert-placement native|partitioned  partitioned keeps GPU and CPU primary experts disjoint;\n"
+                 "                       uses the static --expert-profile and available RAM or --resident-budget-gib.\n"
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
@@ -1305,6 +1314,98 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
     }
 }
 
+struct Q38ThreeLevelState {
+    struct Span { void* address; size_t bytes; size_t offset; };
+    std::vector<Span> fixed, saved;
+    strata::core::SessionState* session = nullptr;
+    const strata::core::ModelGeometry* geometry = nullptr;
+    const strata::core::QsaState* draft = nullptr;
+    std::array<void*, 4> draft_parts{};
+    std::array<uint64_t, 5> draft_page_bytes{};
+    uint8_t* snapshot = nullptr;
+    size_t fixed_bytes = 0, capacity = 0;
+    int32_t prev[2] = {-1, -1}, ple_token = -1;
+    bool valid = false;
+    ~Q38ThreeLevelState() { if (snapshot) (void) cudaFree(snapshot); }
+
+    bool reserve(strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                 const strata::core::QsaState& mtp, std::string& err) {
+        session = &ss; geometry = &g; draft = &mtp;
+        strata::core::ConversationStateSizes sizes;
+        if (!strata::core::conversation_session_sizes(g, ss, sizes, err)) return false;
+        auto add = [&](void* address, size_t bytes) {
+            if (bytes) { fixed.push_back({address, bytes, fixed_bytes}); fixed_bytes += bytes; }
+        };
+        add(ss.gdn_state, sizes.gdn);
+        add(ss.ple_hist, sizes.ple);
+        add(ss.R, (size_t) g.hc * g.n_embd * sizeof(float));
+        for (int64_t q = 0; q < ss.qsa_alloc; ++q) {
+            auto& st = ss.qsa_states[ss.qsa_ord0 + q];
+            if (st.kv_mode != 0) { err = "three-level: streamed target KV is unsupported"; return false; }
+            add(st.idx_tail, sizes.tail); add(st.idx_dead, sizes.dead); add(st.idx_block_pos, sizes.block_pos);
+        }
+        const auto shape = strata::core::qsa_shapes(g);
+        if (!strata::core::conversation_kv_part_sizes(mtp, g, shape.page_size, false, draft_page_bytes, err)) return false;
+        if (mtp.kv_q4) draft_parts = {mtp.k_q4, mtp.v_q4, nullptr, nullptr};
+        else if (mtp.kv_int8) draft_parts = {mtp.k_q, mtp.v_q, mtp.k_scale, mtp.v_scale};
+        else draft_parts = {mtp.k_pool, mtp.v_pool, nullptr, nullptr};
+        size_t one_page = 0;
+        for (size_t i = 0; i < draft_parts.size(); ++i) one_page += (size_t) draft_page_bytes[i];
+        capacity = fixed_bytes + (size_t) ss.qsa_alloc * 2 * g.idx_key_dim * sizeof(float) + 10 * one_page;
+        if (cudaMalloc((void**) &snapshot, capacity) != cudaSuccess) {
+            err = "three-level: private mutable-state allocation failed"; return false;
+        }
+        return true;
+    }
+
+    bool save(int64_t position, std::string& err) {
+        valid = false;
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "three-level: state save synchronization failed"; return false; }
+        saved = fixed;
+        size_t used = fixed_bytes;
+        auto append = [&](void* address, size_t bytes) {
+            if (bytes) { saved.push_back({address, bytes, used}); used += bytes; }
+        };
+        const auto shape = strata::core::qsa_shapes(*geometry);
+        // The partial block and spare row can belong to the confirmed boundary. Later rows are suffix data,
+        // which Full Verify rewrites before its causal indexer can read them.
+        for (int64_t q = 0; q < session->qsa_alloc; ++q) {
+            auto& st = session->qsa_states[session->qsa_ord0 + q];
+            const int64_t row = position / shape.idx_block;
+            const size_t n = (size_t) std::clamp<int64_t>(st.idx_pooled_rows - row, 0, 2);
+            append(st.idx_pooled + row * shape.idx_dim, n * (size_t) shape.idx_dim * sizeof(float));
+        }
+        std::vector<int64_t> pages;
+        const int64_t b0 = std::max<int64_t>(0, position - 1) / shape.page_size;
+        const int64_t b1 = std::min<int64_t>(draft->max_cells - 1, position + strata::core::kThreeLevelMaxRows) / shape.page_size;
+        for (int64_t b = b0; b <= b1; ++b) {
+            const int64_t slot = draft->kv_mode == 2 ? b % draft->n_slots : b;
+            if (std::find(pages.begin(), pages.end(), slot) != pages.end()) continue;
+            pages.push_back(slot);
+            for (size_t i = 0; i < draft_parts.size(); ++i)
+                if (draft_parts[i]) append((uint8_t*) draft_parts[i] + slot * draft_page_bytes[i], (size_t) draft_page_bytes[i]);
+        }
+        if (used > capacity) { err = "three-level: private mutable-state capacity exceeded"; return false; }
+        prev[0] = session->ple_prev[0]; prev[1] = session->ple_prev[1]; ple_token = session->ple_token;
+        for (const auto& span : saved)
+            if (cudaMemcpy(snapshot + span.offset, span.address, span.bytes, cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                err = "three-level: private-state copy failed"; return false;
+            }
+        valid = true;
+        return true;
+    }
+    bool restore(std::string& err) {
+        if (!valid) return true;
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "three-level: state restore synchronization failed"; return false; }
+        for (const auto& span : saved)
+            if (cudaMemcpy(span.address, snapshot + span.offset, span.bytes, cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                err = "three-level: private-state restore failed"; return false;
+            }
+        session->ple_prev[0] = prev[0]; session->ple_prev[1] = prev[1]; session->ple_token = ple_token;
+        return true;
+    }
+};
+
 /// The verify window's pool as every decode has always run it (Default arithmetic), and the same with the window-invariant native
 /// arithmetic that a probabilistic (STRATA_SPEC_PROB) decode uses, so a row's target distribution does not depend on the window.
 void drive_pool_multi(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
@@ -1313,6 +1414,276 @@ void drive_pool_multi(void* u, const float* x, const int32_t* ids, int64_t n, in
 void drive_pool_multi_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
     drive_pool_multi_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::WindowInvariant);
 }
+
+struct Q38ThreeLevelAdapter {
+    strata::core::Verifier& ver;
+    strata::core::MtpDrafter& mtp;
+    Q38ThreeLevelState& state;
+    strata::core::SessionState& session;
+    const strata::core::ModelGeometry& geometry;
+    Drive& drive;
+    strata::core::FileExpertSource& source;
+    const std::vector<int32_t>& resident;
+    const std::vector<int64_t>& eos_ids;
+    const strata::core::ThreeLevelConfig& config;
+    std::function<bool()> stop;
+    int64_t position = 0, base = 0;
+    uint64_t window = 0;
+    std::vector<int32_t> ready{}, picks{}, full_inputs{};
+    std::vector<std::vector<int32_t>> routes{};
+    int full_keep = 0;
+    bool replaying = false;
+    int64_t pre_gpu_offload = 0, full_gpu_offload = 0;
+    bool frozen = false, source_scope = false, old_record = true, old_learn = true, abort_failed = false;
+    strata::core::RouterLookahead* old_lookahead = nullptr;
+
+    bool cancelled() const { return stop && stop(); }
+    bool is_eos(int32_t token) const {
+        return std::find(eos_ids.begin(), eos_ids.end(), (int64_t) token) != eos_ids.end();
+    }
+    bool begin_window(std::string& err) {
+        base = position; full_keep = 0;
+        old_record = drive.d.record_usage; old_learn = drive.d.learn_foresight;
+        old_lookahead = drive.d.lookahead;
+        if (drive.d.failed) { err = "three-level: expert source is already failed"; return false; }
+        if (!state.save(position, err)) return false;
+        ready = resident;
+        if (drive.d.fs) {
+            std::vector<int32_t> foresight;
+            if (!drive.d.fs->begin_window(foresight, err)) return false;
+            frozen = true;
+            for (size_t i = 0; i < ready.size() && i < foresight.size(); ++i)
+                if (ready[i] < 0 && foresight[i] >= 0) ready[i] = foresight[i];
+        }
+        source.speculative_begin(++window); source_scope = true;
+        drive.d.record_usage = false; drive.d.learn_foresight = false; drive.d.lookahead = nullptr;
+        return true;
+    }
+    bool draft(int32_t anchor, int n, std::vector<int32_t>& drafts, std::string& err) {
+        drafts.clear();
+        if (n == 0) return true;
+        drafts.resize((size_t) std::max(n, mtp.max_t() - 1), 0);
+        mtp.set_max_drafts(n);
+        int made = 0;
+        if (!mtp.draft_first(1, session.R, anchor, position - 1, drafts.data(), err,
+                             nullptr, 0.0f, &made)) return false;
+        drafts.resize((size_t) made);
+        return true;
+    }
+    bool verify(strata::core::SpeculativeStage stage, const std::vector<int32_t>& inputs,
+                std::vector<int32_t>& outputs, std::string& err) {
+        source.speculative_stage(stage);
+        ver.set_preverify_routes(stage == strata::core::SpeculativeStage::PreVerify ? config.top_h : 0, ready.data());
+        routes.assign((size_t) geometry.n_layers, {});
+        ver.set_route_observer([&](int64_t layer, int row0, const int32_t* ids, const float*, int n, int k) {
+            auto& row = routes[(size_t) layer];
+            row.resize(inputs.size() * (size_t) k);
+            std::copy(ids, ids + (size_t) n * k, row.begin() + (size_t) row0 * k);
+        });
+        drive.d.plan = ver.plan_sink();
+        outputs.resize(inputs.size());
+        const int64_t offload_before = drive.d.offload_entries;
+        if (!ver.run((int) inputs.size(), inputs.data(), position, &drive_pool_multi_invariant,
+                     &drive, outputs.data(), err)) return false;
+        ver.set_route_observer({});
+        if (drive.d.failed) {
+            err = drive.d.fail ? drive.d.fail : "three-level: expert dispatch failed"; return false;
+        }
+        if (drive.d.fs && drive.d.fs->failed.load()) { err = "three-level: Foresight copy failed"; return false; }
+        if (ver.nonfinite_row() >= 0) { err = "three-level: nonfinite target logits"; return false; }
+        (stage == strata::core::SpeculativeStage::PreVerify ? pre_gpu_offload : full_gpu_offload) +=
+            drive.d.offload_entries - offload_before;
+        picks = outputs;
+        if (stage == strata::core::SpeculativeStage::FullVerify && !replaying) full_inputs = inputs;
+        return true;
+    }
+    bool commit(strata::core::SpeculativeStage stage, int n, std::string& err) {
+        if (!ver.commit(n, err) || !ver.wait_commit(err) ||
+            !mtp.prefill(ver.final_R_all(), picks.data(), n, position, err)) return false;
+        if (drive.d.fs && drive.d.fs->failed.load()) { err = "three-level: Foresight copy failed"; return false; }
+        if (cudaMemcpy(session.R, ver.final_R(n - 1), (size_t) geometry.hc * geometry.n_embd * sizeof(float),
+                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            err = "three-level: MTP seed update failed"; return false;
+        }
+        if (stage == strata::core::SpeculativeStage::PreVerify) {
+            for (int64_t l = 0; l < geometry.n_layers; ++l)
+                if (!routes[(size_t) l].empty())
+                    source.speculative_hint(l, routes[(size_t) l].data(), (int64_t) picks.size(), session.k, n,
+                                             ready.data() + l * geometry.n_expert);
+        } else full_keep = n;
+        position += n;
+        if (const char* check = std::getenv("STRATA_Q38_WINDOW_CHECK");
+            stage == strata::core::SpeculativeStage::FullVerify && !replaying && check && check[0] == '3')
+            return replay_accepted_inputs(n, err);
+        return true;
+    }
+    bool select_confirmed(std::string& err) {
+        if (!mtp.idle(err) || !state.restore(err)) return false;
+        position = base;
+        return true;
+    }
+    void release() noexcept {
+        ver.set_route_observer({}); ver.set_preverify_routes(0, nullptr);
+        if (frozen) { drive.d.fs->end_window(); frozen = false; }
+        if (source_scope) { source.speculative_end(); source_scope = false; }
+        drive.d.record_usage = old_record; drive.d.learn_foresight = old_learn;
+        drive.d.lookahead = old_lookahead;
+    }
+    void finish_window() noexcept {
+        release();
+        for (int64_t l = 0; l < geometry.n_layers; ++l)
+            if (!routes[(size_t) l].empty())
+                strata::core::expert_dispatch_observe_accepted(drive.d, l, routes[(size_t) l].data(), full_keep, session.k);
+        if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+        state.valid = false;
+    }
+    void abort_window() noexcept {
+        std::string ignored;
+        const bool committed = ver.wait_commit(ignored), drafted = mtp.idle(ignored);
+        const bool restored = state.restore(ignored);
+        abort_failed = !committed || !drafted || !restored;
+        position = base;
+        release(); state.valid = false;
+    }
+    bool capture_valid_state(std::vector<uint8_t>& bytes, std::string& err) {
+        bytes.clear();
+        auto append = [&](const void* address, size_t n) {
+            const size_t at = bytes.size(); bytes.resize(at + n);
+            return n == 0 || cudaMemcpy(bytes.data() + at, address, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+        };
+        for (const auto& span : state.fixed)
+            if (!append(span.address, span.bytes)) { err = "three-level check: state read failed"; return false; }
+        const auto* host = reinterpret_cast<const uint8_t*>(session.ple_prev);
+        bytes.insert(bytes.end(), host, host + sizeof(session.ple_prev));
+        host = reinterpret_cast<const uint8_t*>(&session.ple_token);
+        bytes.insert(bytes.end(), host, host + sizeof(session.ple_token));
+        auto kv = [&](const strata::core::QsaState& st, bool index) {
+            strata::core::ConversationKv image;
+            if (!strata::core::conversation_kv_save(image, st, geometry, position, index, err)) return false;
+            for (const auto* part : {&image.k, &image.v, &image.k_scale, &image.v_scale}) {
+                if (part->empty()) continue;
+                const size_t per = part->size() / (size_t) (image.cells * image.heads);
+                for (int64_t t = 0; t < position; ++t)
+                    for (int64_t h = 0; h < image.heads; ++h) {
+                        const size_t at = bytes.size(); bytes.resize(at + per);
+                        const size_t cell = (size_t) ((t / image.page_size * image.heads + h) * image.page_size + t % image.page_size);
+                        if (!part->read(bytes.data() + at, cell * per, per)) return false;
+                    }
+            }
+            const size_t at = bytes.size(); bytes.resize(at + image.pooled.size());
+            return image.pooled.empty() || image.pooled.read(bytes.data() + at, 0, image.pooled.size());
+        };
+        for (int64_t q = 0; q < session.qsa_alloc; ++q)
+            if (!kv(session.qsa_states[session.qsa_ord0 + q], true)) return false;
+        if (!kv(mtp.kv_state(), false)) return false;
+        const auto& ds = mtp.kv_state();
+        if (ds.kv_mode == 2) {
+            const auto shape = strata::core::qsa_shapes(geometry);
+            const int64_t end = (position + shape.page_size - 1) / shape.page_size;
+            const int64_t first = std::max<int64_t>(0, end - ds.n_slots) * shape.page_size;
+            for (size_t part = 0; part < state.draft_parts.size(); ++part) {
+                if (!state.draft_parts[part]) continue;
+                const size_t row_bytes = (size_t) state.draft_page_bytes[part] /
+                                         (size_t) (shape.page_size * geometry.n_head_kv);
+                for (int64_t t = first; t < position; ++t)
+                    for (int64_t h = 0; h < geometry.n_head_kv; ++h) {
+                        const size_t slot = (size_t) (t / shape.page_size % ds.n_slots);
+                        const size_t at = slot * (size_t) state.draft_page_bytes[part] +
+                                          (size_t) (h * shape.page_size + t % shape.page_size) * row_bytes;
+                        if (!append((const uint8_t*) state.draft_parts[part] + at, row_bytes)) {
+                            err = "three-level check: draft ring read failed"; return false;
+                        }
+                    }
+            }
+        }
+        return true;
+    }
+    bool replay_accepted_inputs(int n, std::string& err) {
+        if (drive.d.pcie_num != 0 || ver.pcie_balance_on() ||
+            (std::getenv("STRATA_PCIE_BALANCE") && std::atoi(std::getenv("STRATA_PCIE_BALANCE")) != 0)) {
+            err = "three-level check: frozen dispatch replay requires --pcie-frac 0 and STRATA_PCIE_BALANCE=0";
+            return false;
+        }
+        const auto actual_picks = picks, actual_inputs = full_inputs;
+        auto actual_routes = routes;
+        std::vector<uint8_t> actual, replayed;
+        if (!capture_valid_state(actual, err) || !select_confirmed(err)) return false;
+        struct ReplayGuard {
+            bool& active;
+            explicit ReplayGuard(bool& value) : active(value) { active = true; }
+            ~ReplayGuard() { active = false; }
+        } guard(replaying);
+        for (int row = 0; row < n; ++row) {
+            const std::vector<int32_t> input{actual_inputs[(size_t) row]};
+            std::vector<int32_t> output;
+            if (!verify(strata::core::SpeculativeStage::FullVerify, input, output, err)) return false;
+            if (output[0] != actual_picks[(size_t) row]) {
+                err = "three-level check: actual Full pick differs on accepted input " + std::to_string(row);
+                return false;
+            }
+            if (!commit(strata::core::SpeculativeStage::FullVerify, 1, err)) return false;
+        }
+        if (!capture_valid_state(replayed, err)) return false;
+        if (actual != replayed) {
+            const auto diff = std::mismatch(actual.begin(), actual.end(), replayed.begin(), replayed.end());
+            err = "three-level check: actual Full committed state differs at byte " +
+                  std::to_string(diff.first - actual.begin());
+            return false;
+        }
+        routes = std::move(actual_routes); picks = actual_picks; full_inputs = actual_inputs; full_keep = n;
+        uint64_t view = 1469598103934665603ull;
+        for (int32_t slot : ready) view = (view ^ (uint32_t) slot) * 1099511628211ull;
+        uint64_t main_view = 1469598103934665603ull;
+        for (int32_t slot : resident) main_view = (main_view ^ (uint32_t) slot) * 1099511628211ull;
+        std::fprintf(stderr, "strata three-level: actual Full accepted-input replay passed %d rows at %lld, "
+                             "frozen view %016llx, main cache %016llx\n", n, (long long) base,
+                     (unsigned long long) view, (unsigned long long) main_view);
+        return true;
+    }
+    bool check_windows(std::string& err) {
+        int checked = 0;
+        for (const int width : {1, 4, 8, 9, 16, 17, 24, 25}) {
+            if (position + width > session.max_cells) continue;
+            if (!begin_window(err)) { abort_window(); return false; }
+            std::vector<int> keeps{1};
+            if (width / 2 > 1) keeps.push_back(width / 2);
+            if (width > 1) keeps.push_back(width);
+            std::vector<std::vector<uint8_t>> reference(keeps.size());
+            std::vector<int32_t> inputs((size_t) width), expected, outputs;
+            for (int i = 0; i < width; ++i) inputs[(size_t) i] = 198 + 7 * i;
+            bool ok = true;
+            for (int i = 0; ok && i < width; ++i) {
+                const std::vector<int32_t> input{inputs[(size_t) i]};
+                ok = verify(strata::core::SpeculativeStage::FullVerify, input, outputs, err) &&
+                     commit(strata::core::SpeculativeStage::FullVerify, 1, err);
+                if (!ok) break;
+                expected.push_back(outputs[0]);
+                for (size_t k = 0; k < keeps.size(); ++k)
+                    if (keeps[k] == i + 1) ok = capture_valid_state(reference[k], err);
+            }
+            if (ok) ok = select_confirmed(err);
+            for (size_t k = 0; ok && k < keeps.size(); ++k) {
+                ok = verify(strata::core::SpeculativeStage::FullVerify, inputs, outputs, err);
+                if (ok && outputs != expected) { err = "three-level check: Full picks differ at width " + std::to_string(width); ok = false; }
+                if (ok) ok = commit(strata::core::SpeculativeStage::FullVerify, keeps[k], err);
+                std::vector<uint8_t> actual;
+                if (ok) ok = capture_valid_state(actual, err);
+                if (ok && actual != reference[k]) {
+                    const auto diff = std::mismatch(actual.begin(), actual.end(), reference[k].begin(), reference[k].end());
+                    err = "three-level check: native state differs at width " + std::to_string(width) +
+                          " keep " + std::to_string(keeps[k]) + " byte " + std::to_string(diff.first - actual.begin());
+                    ok = false;
+                }
+                if (ok) { ++checked; ok = select_confirmed(err); }
+            }
+            abort_window();
+            if (abort_failed) { err = "three-level check: rollback failed"; return false; }
+            if (!ok) return false;
+        }
+        std::fprintf(stderr, "strata three-level: Qwen3.8 native window/state check passed %d width/keep shapes\n", checked);
+        return true;
+    }
+};
 
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
@@ -3040,6 +3411,14 @@ int main(int argc, char** argv) {
         else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(next("--yarn-beta-fast"));
         else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(next("--yarn-beta-slow"));
         else if (a == "--greedy") o.greedy = true;
+        else if (a == "--three-level") o.three_level.enabled = true;
+        else if (a == "--three-level-depth" || a == "--three-level-loops" || a == "--preverify-top-h") {
+            int* value = a == "--three-level-depth" ? &o.three_level.depth
+                       : a == "--three-level-loops" ? &o.three_level.loops : &o.three_level.top_h;
+            if (!strata::core::three_level_parse_int(next(a.c_str()), *value)) {
+                std::fprintf(stderr, "strata generate: %s requires an integer\n", a.c_str()); return 2;
+            }
+        }
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
@@ -3339,6 +3718,14 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--expert-placement") {
+            const std::string v = next("--expert-placement");
+            if (v != "native" && v != "partitioned") {
+                std::fprintf(stderr, "strata generate: --expert-placement takes native or partitioned\n");
+                return 2;
+            }
+            o.partitioned_experts = v == "partitioned";
+        }
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -3352,8 +3739,13 @@ int main(int argc, char** argv) {
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
         else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
+            const char* value = next("--resident-budget-gib");
+            char* end = nullptr;
+            const double gib = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(gib) || gib <= 0 || gib >= (double) (1ull << 34)) {
+                std::fprintf(stderr, "strata generate: --resident-budget-gib needs a finite N > 0\n");
+                return 2;
+            }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 4ull << 30;
@@ -3527,6 +3919,39 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.three_level.enabled) {
+        std::string error;
+        if (!o.three_level.validate(error)) { std::fprintf(stderr, "%s\n", error.c_str()); return 2; }
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+        std::fprintf(stderr, "strata generate: --three-level requires the CUDA engine\n"); return 2;
+#endif
+        if (!o.greedy || o.vision || o.batch != 0 || !o.layer_split.empty() || o.peer_device >= 0 ||
+            o.kv_resident != 0 || o.kv_grow ||
+            (std::getenv("STRATA_KV_GROW") && std::atoi(std::getenv("STRATA_KV_GROW")) != 0) ||
+            !o.shared_expert_arena.empty() || o.prefill_head_alias || (!o.draft.empty() && o.draft != "mtp") ||
+            std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int n) { return n != 0; }) ||
+            std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(), [](bool b) { return b; })) {
+            std::fprintf(stderr, "strata generate: --three-level requires greedy text, one CUDA GPU and one request, "
+                                 "with fully resident target KV\n"); return 2;
+        }
+        if (o.mtp.empty() || o.mtp == "off" || o.mtp == "0") {
+            std::fprintf(stderr, "strata generate: --three-level requires enabled MTP weights (--mtp DIR)\n"); return 2;
+        }
+        o.spec = std::min(o.three_level.depth + 1, 8);
+        o.suffix_draft = 0; o.lookup_chain = 0; o.pipeline_windows = 0; o.adapt_async = false; o.adapt_async_self = false;
+#if defined(_WIN32)
+        _putenv_s("STRATA_ROUTE_RESIDENT", "0"); _putenv_s("STRATA_ROUTE_TAIL_SKIP", "0");
+        _putenv_s("STRATA_ROUTE_PRIOR", "0"); _putenv_s("STRATA_KVA", "0");
+        _putenv_s("STRATA_PREFILL_WARM", "0");
+        _putenv_s("STRATA_IQ_MT_MIN", "1");
+#else
+        setenv("STRATA_ROUTE_RESIDENT", "0", 1); setenv("STRATA_ROUTE_TAIL_SKIP", "0", 1);
+        setenv("STRATA_ROUTE_PRIOR", "0", 1); setenv("STRATA_KVA", "0", 1);
+        setenv("STRATA_PREFILL_WARM", "0", 1);
+        setenv("STRATA_IQ_MT_MIN", "1", 1);
+#endif
+        strata::core::set_tail_skip_rank(0);
+    }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
@@ -3644,6 +4069,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    if (o.partitioned_experts) {
+        o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -6089,7 +6517,7 @@ int main(int argc, char** argv) {
         // (--batch-mtp and STRATA_PIPED_MTP draft with the draft layer's kernels, built for the narrow window: their windows
         // stay at most kVerifyNarrowT rows; only the plain batch windows are wide)
         if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyNarrowT;
-        const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
+        const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kWindowMaxT));
         const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
             ? std::min<int>(strata::kernels::kVerifyNarrowT, (o.batch / o.batch_groups) * (1 + pm_drafts)) : 0;
         return std::max(plain, group_rows);
@@ -6099,7 +6527,7 @@ int main(int argc, char** argv) {
     // group for --adapt-async 1), dividing the slots, each at most kVerifyMaxT, all at most one group's worth per
     // stage.  (--batch-mtp: n, as before.)
     auto slots_in_windows = [&](int n) {
-        const int cap = strata::kernels::kVerifyMaxT;
+        const int cap = strata::kernels::kWindowMaxT;
         if (batch_mtp || n <= cap) return n;
         const int asked = o.batch;
         for (; n > cap; --n) {
@@ -6113,7 +6541,7 @@ int main(int argc, char** argv) {
     };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
-        const int cap = strata::kernels::kVerifyMaxT;
+        const int cap = strata::kernels::kWindowMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
@@ -6201,7 +6629,7 @@ int main(int argc, char** argv) {
             const int n = slots_in_windows(fit);   // (the slots that fit are held to kVerifyMaxT rows per group too)
             if (n < fit) {
                 std::fprintf(stderr, "strata generate: WARNING: --batch: %d slot sessions fit, and a batch window holds "
-                                     "at most %d rows, so %d slots\n", fit, (int) strata::kernels::kVerifyMaxT, n);
+                                     "at most %d rows, so %d slots\n", fit, (int) strata::kernels::kWindowMaxT, n);
                 for (auto& v : bslot_ss) v.resize((size_t) n);
                 fit = n;
             }
@@ -6293,7 +6721,8 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT : o.spec;
+        const int mtp_t = o.three_level.enabled ? o.three_level.depth + 1
+                        : o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
@@ -6394,6 +6823,31 @@ int main(int argc, char** argv) {
     }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
+    strata::core::PcieModel three_balance_reservation;
+    std::unique_ptr<strata::core::Verifier> three_ver;
+    Q38ThreeLevelState three_state;
+    if (o.three_level.enabled) {
+        if (!native_pack || !native_head.loaded() || !o.three_level.validate(err, (int) ss.k)) {
+            std::fprintf(stderr, "strata generate: --three-level needs a native Qwen3.8 target and head: %s\n", err.c_str());
+            return 2;
+        }
+        three_ver = std::make_unique<strata::core::Verifier>();
+        three_ver->set_transactional(true);
+        three_ver->set_split(o.spec_split);
+        three_ver->set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        if (pcie_balance()) three_ver->set_pcie_balance(&three_balance_reservation);
+        strata::core::VerifyHits pending_hits;
+        pending_hits.blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (!three_ver->init(wt, g, ss, pending_hits, &native_head, strata::core::kThreeLevelMaxRows, err) ||
+            !mtp.bind(wt, &native_head, three_ver->final_R_all(), err) ||
+            !three_state.reserve(ss, g, mtp.kv_state(), err) ||
+            !mtp.reserve_prefill(strata::core::kThreeLevelMaxRows, err) || !mtp.prepare_draft(err) ||
+            !three_ver->prepare_transactional(o.three_level.depth + 1, err)) {
+            std::fprintf(stderr, "strata generate: three-level reservation: %s\n", err.c_str());
+            return 1;
+        }
+        mem_mark("three-level private state, 25-row scratch and graphs");
+    }
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -6687,7 +7141,7 @@ int main(int argc, char** argv) {
                         cap_bytes = (uint64_t) o.expert_cache * nibble_max_slot_bytes();
                     } else {
                         const int64_t pf_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-                        int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
+                        int64_t mtp_b = (!three_ver && !o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
                         if (use_df2 && native_head.loaded()) mtp_b += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits
@@ -6929,7 +7383,7 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
-        int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
+        int64_t mtp_bind = (!three_ver && !o.mtp.empty() && native_head.loaded())
                                ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab)
                                : (mtp_first && last_st->head.loaded()) ? (int64_t) mtp.bind_bytes(last_st->head.row_bytes(), n_vocab) : 0;
         // (with a layer split the slot drafters bind on the last stage, whose cache is sized from what is free there)
@@ -7738,7 +8192,7 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    if (!o.three_level.enabled && srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -9090,7 +9544,7 @@ int main(int argc, char** argv) {
     };
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
-        if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
+        if (!o.partitioned_experts && o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
@@ -9128,7 +9582,7 @@ int main(int argc, char** argv) {
         // pin_cache_complement's own path, and no regions are set.
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
-        if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
+        if (!o.partitioned_experts && pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
             const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
             static const bool own_ok = [] {
                 const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
@@ -9180,8 +9634,19 @@ int main(int argc, char** argv) {
             src.set_extra_drop_files(std::move(drop));
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
-                                                    o.resident_headroom, o.resident_budget, &rank_all);
+        bool resident_ok;
+        if (o.partitioned_experts) {
+            auto gpu_pairs = stage_pairs;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (xcache.slot_of(l, e) >= 0) gpu_pairs.emplace_back((int32_t) l, (int32_t) e);
+            resident_ok = src.pin_partition(gpu_pairs, err,
+                o.resident_budget > 0 ? o.resident_budget : strata::core::FileExpertSource::kResidentWhatFits,
+                rank_all, o.resident_pin, o.resident_headroom);
+        } else {
+            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
+                                                  o.resident_headroom, o.resident_budget, &rank_all);
+        }
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -9959,7 +10424,7 @@ int main(int argc, char** argv) {
         constexpr int kPenaltyWindowCap = 4096;
         // (the widest window the run can have: a batch of more than kVerifyNarrowT slots is the only way to a wider one)
         const size_t kHistSlots = (size_t) kPenaltyWindowCap *
-            (size_t) (o.batch > strata::kernels::kVerifyNarrowT ? strata::kernels::kVerifyMaxT : strata::kernels::kVerifyNarrowT);
+            (size_t) (o.batch > strata::kernels::kVerifyNarrowT ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT);
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -9967,7 +10432,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
-        strata::core::Verifier ver;
+        strata::core::Verifier legacy_ver;
+        strata::core::Verifier& ver = three_ver ? *three_ver : legacy_ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
@@ -10034,7 +10500,7 @@ int main(int argc, char** argv) {
             const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT, (1 + pm_drafts) * o.batch)
                             : !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyNarrowT, o.batch)
                             : !batch_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT,
-                                                         std::min<int>(o.batch, strata::kernels::kVerifyMaxT))
+                                                         std::min<int>(o.batch, strata::kernels::kWindowMaxT))
                                          : strata::kernels::kVerifyNarrowT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
@@ -10088,7 +10554,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kWindowMaxT)), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -10184,9 +10650,10 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_max_t(), err) ||
-            (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+        if (!(three_ver ? ver.bind_transactional_hits(vh, err)
+                        : ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+                                   batch_max_t(), err)) ||
+            (use_mtp && !three_ver && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
@@ -12786,15 +13253,15 @@ int main(int argc, char** argv) {
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
             int S = 0;
-            int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kWindowMaxT] = {};
+            int32_t tok[strata::kernels::kWindowMaxT] = {}, outb[strata::kernels::kWindowMaxT] = {};
+            int64_t pos[strata::kernels::kWindowMaxT] = {};
+            int first[strata::kernels::kWindowMaxT] = {}, active[strata::kernels::kWindowMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
             // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; the plain windows hold up to kVerifyMaxT)
-            const int win_cap = batch_mtp ? (int) strata::kernels::kVerifyNarrowT : (int) strata::kernels::kVerifyMaxT;
+            const int win_cap = batch_mtp ? (int) strata::kernels::kVerifyNarrowT : (int) strata::kernels::kWindowMaxT;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= win_cap; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
@@ -13026,25 +13493,25 @@ int main(int argc, char** argv) {
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
                          "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
                          "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
-        if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
+        if (GS > strata::kernels::kWindowMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
             std::fprintf(stderr, "strata generate: --batch %d in %d group%s: more than %d rows per window\n",
                          o.batch, std::max(o.batch_groups, 1), o.batch_groups > 1 ? "s" : "",
-                         (int) strata::kernels::kVerifyMaxT);
+                         (int) strata::kernels::kWindowMaxT);
             return 1;
         }
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
-            int32_t tok[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[strata::kernels::kWindowMaxT] = {};
+            int64_t pos[strata::kernels::kWindowMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
             int active = 0;                  ///< live slots at launch; S can also include idle padding rows
             Clock::time_point started;       ///< the group window's first stage launch
             // STRATA_PIPED_MTP (pmtp): S counts ROWS - each of the group's slots' token, then that slot's proposals - at
             // hand-off rows [hbase, hbase + S)
-            int rows[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kWindowMaxT] = {};
             int hbase = 0;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
@@ -13959,6 +14426,13 @@ int main(int argc, char** argv) {
                     }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            if (o.three_level.enabled && (geni || req_temperature != 0.0f || req_penalty_repeat != 1.0f ||
+                req_penalty_freq != 0.0f || req_penalty_present != 0.0f || req_bias_present ||
+                req_logprobs >= 0 || !req_allowed.empty())) {
+                std::printf("ERR three-level requires greedy text without penalties, logit bias, allowed ids or logprobs\n");
+                std::fflush(stdout);
+                continue;
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             std::vector<float> req_bias;
@@ -15794,7 +16268,7 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
-            const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+            const bool gated_proposal = !o.three_level.enabled && use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
                 gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && n_stages == 1 && !multi_gpu && drive.d.remote_count == 0,
                                       o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0 || o.pcie_frac_auto, spec_cost, S,
                                       req_spec_min_p);
@@ -15894,14 +16368,14 @@ int main(int argc, char** argv) {
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
-                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
+                if (o.three_level.enabled || !admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
                 if (host_res.empty() || !pending.empty() ||
                     std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; }))
                     return -1;
-                int mt = strata::kernels::kVerifyMaxT;
+                int mt = strata::kernels::kWindowMaxT;
                 for (int k = 0; k < n_pipe; ++k) {
                     if (!stage_verifier(k).ar_live()) return -1;
                     mt = std::min(mt, stage_verifier(k).max_t());
@@ -16734,7 +17208,49 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            while (!pl_ran && !cancelled && produced_n < max_new) {
+            if (o.three_level.enabled && !cancelled) {
+                Q38ThreeLevelAdapter adapter{ver, mtp, three_state, ss, g, drive, src, host_res, o.eos_ids,
+                                             o.three_level, [&] { return stop_req.load(); }};
+                adapter.position = p;
+                int64_t pre_calls = 0, pre_rows = 0, full_rows = 0;
+                while (produced_n < max_new && p < o.max_context) {
+                    const auto window_start = Clock::now();
+                    adapt_quiesce();
+                    if (a_err) { std::printf("ERR an adaptive refill failed\n"); return 1; }
+                    strata::core::ThreeLevelResult result;
+                    const int64_t budget = first_window ? 1 : max_new - produced_n;
+                    if (!strata::core::run_three_level_window(adapter, o.three_level, x, budget,
+                                                              o.max_context - p, result, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    if (adapter.abort_failed) { std::printf("ERR three-level rollback failed\n"); return 1; }
+                    if (result.cancelled) { finish = "cancel"; break; }
+                    if (result.outputs.empty()) break;
+                    consumed.push_back(x);
+                    for (int i = 1; i < result.committed_inputs; ++i)
+                        consumed.push_back(result.candidates[(size_t) i - 1]);
+                    for (int32_t token : result.outputs) {
+                        std::printf("T %d\n", token); strata::core::progress_beat(); ++produced_n;
+                    }
+                    std::fflush(stdout);
+                    first_window = false; p = adapter.position; x = result.next_anchor;
+                    ++rounds; ++dec_windows; dec_T += result.full_verify_inputs;
+                    pre_calls += result.preverify_calls; pre_rows += result.preverify_inputs;
+                    full_rows += result.full_verify_inputs;
+                    draft_offered += result.candidates.size(); draft_accepted += result.accepted_candidates;
+                    dt_run += std::chrono::duration<double, std::milli>(Clock::now() - window_start).count();
+                    if (result.stopped_eos) { finish = "stop"; break; }
+                    if (!drive.d.usage.empty() && (rounds % o.adapt_iv(rounds)) == 0 && !adapt()) {
+                        std::printf("ERR an adaptive refill failed\n"); return 1;
+                    }
+                }
+                std::fprintf(stderr, "strata three-level: %lld Pre-Verify calls, %lld Pre rows, %lld Full rows, "
+                                     "%lld/%lld candidates accepted, Pre GPU offload %lld, Full GPU offload %lld\n",
+                             (long long) pre_calls, (long long) pre_rows, (long long) full_rows,
+                             (long long) draft_accepted, (long long) draft_offered,
+                             (long long) adapter.pre_gpu_offload, (long long) adapter.full_gpu_offload);
+            }
+            while (!o.three_level.enabled && !pl_ran && !cancelled && produced_n < max_new) {
                 int T = 1;
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
@@ -17766,7 +18282,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!o.mtp.empty()) {
-            if (!mtp.bind(wt, &native_head, nullptr, err)) {
+            if (!three_ver && !mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -18103,7 +18619,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         mem_mark("the head and the prompt path");
-        strata::core::Verifier ver;
+        strata::core::Verifier legacy_ver;
+        strata::core::Verifier& ver = three_ver ? *three_ver : legacy_ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
@@ -18115,12 +18632,13 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) ver.set_taps(df2.tap_layers());
 #endif
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        if (!(three_ver ? ver.bind_transactional_hits(vh, err)
+                        : ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         const bool use_mtp = !o.mtp.empty();
-        if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+        if (use_mtp && !three_ver && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -18362,7 +18880,7 @@ int main(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
-        std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
+        std::vector<int64_t> window_hist((size_t) (o.three_level.enabled ? strata::core::kThreeLevelMaxRows : o.spec) + 1, 0);
         // STRATA_SPEC_T_CYCLE=1,2,3,4,5,6,7,8 (bench only, off by default): the window size cycles through the list, so one run
         // measures the cost of each verify width (with --spec-oracle drafts every row is accepted); the first round of a
         // width (its graph capture) is not counted
@@ -18394,7 +18912,7 @@ int main(int argc, char** argv) {
 #else
         const bool spec_uses_df2 = false;   // no DFlash2 drafter in this build (Metal)
 #endif
-        const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+        const bool gated_proposal = !o.three_level.enabled && use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
             gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && !multi_gpu && drive.d.remote_count == 0,
                                   o.lookup_chain, o.adapt_swaps, o.pcie_frac != 0.0 || o.pcie_frac_auto,
                                   spec_cost || spec_uses_df2 || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
@@ -18404,7 +18922,7 @@ int main(int argc, char** argv) {
         strata::core::gated::Packet proposal;
         {   // Non-native prefill already emitted x; draft_first(cell=p-1) samples at p.
             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p, o.max_context);
-            if (use_mtp && !first_window &&
+            if (!o.three_level.enabled && use_mtp && !first_window &&
                 !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
                                  nullptr, gated_proposal ? &generation : nullptr)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -18419,7 +18937,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<float> hash_rows;
-        std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
+        std::vector<int64_t> accepted_hist((size_t) (o.three_level.enabled ? strata::core::kThreeLevelMaxRows : o.spec), 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
@@ -18528,7 +19046,45 @@ int main(int argc, char** argv) {
                              nullptr, gated_proposal ? &generation : nullptr);
         };
         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
-        while ((int64_t) produced.size() < max_new) {
+        if (o.three_level.enabled) {
+            const std::vector<int64_t> no_eos;
+            Q38ThreeLevelAdapter adapter{ver, mtp, three_state, ss, g, drive, src, host_res,
+                                         o.stop_eos ? o.eos_ids : no_eos, o.three_level, {}};
+            adapter.position = p;
+            if (const char* check = std::getenv("STRATA_Q38_WINDOW_CHECK"); check && check[0] == '1')
+                if (!adapter.check_windows(err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+                }
+            int64_t pre_calls = 0, pre_rows = 0, full_rows = 0;
+            while ((int64_t) produced.size() < max_new && p < o.max_context) {
+                const auto window_start = Clock::now();
+                apply_pending(true);
+                strata::core::ThreeLevelResult result;
+                const int64_t budget = first_window ? 1 : max_new - (int64_t) produced.size();
+                if (!strata::core::run_three_level_window(adapter, o.three_level, x, budget,
+                                                          o.max_context - p, result, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+                }
+                if (result.outputs.empty()) break;
+                if (first_window) ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
+                produced.insert(produced.end(), result.outputs.begin(), result.outputs.end());
+                first_window = false; p = adapter.position; x = result.next_anchor;
+                ++rounds; drafts_total += result.candidates.size(); drafts_ok += result.accepted_candidates;
+                ++window_hist[(size_t) result.full_verify_inputs];
+                ++accepted_hist[(size_t) result.accepted_candidates];
+                pre_calls += result.preverify_calls; pre_rows += result.preverify_inputs;
+                full_rows += result.full_verify_inputs;
+                total_ms += std::chrono::duration<double, std::milli>(Clock::now() - window_start).count();
+                if (result.stopped_eos) break;
+                if (!drive.d.usage.empty() && (rounds % o.adapt_iv(rounds)) == 0 && !adapt()) return 1;
+            }
+            std::fprintf(stderr, "strata three-level: %lld Pre-Verify calls, %lld Pre rows, %lld Full rows, "
+                                 "%lld/%lld candidates accepted, Pre GPU offload %lld, Full GPU offload %lld\n",
+                         (long long) pre_calls, (long long) pre_rows, (long long) full_rows,
+                         (long long) drafts_ok, (long long) drafts_total,
+                         (long long) adapter.pre_gpu_offload, (long long) adapter.full_gpu_offload);
+        }
+        while (!o.three_level.enabled && (int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
         retry_round:
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());

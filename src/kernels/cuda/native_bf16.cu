@@ -295,6 +295,13 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_tok > kWindowMaxT && n_tok <= kSequenceVerifyMaxT && x != nullptr && y != nullptr) {
+        for (int row = 0; row < n_tok; row += kWindowMaxT) {
+            const int n = n_tok - row < kWindowMaxT ? n_tok - row : kWindowMaxT;
+            bf16_gemv_fp32_mmvf_multi(x + row * ldx, ldx, w, y + row * ldy, ldy, n_in, n_out, n, stream);
+        }
+        return;
+    }
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)

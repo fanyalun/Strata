@@ -345,7 +345,7 @@ class SharedArena(unittest.TestCase):
     def test_only_where_there_is_an_arena_to_share(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(self.plan(tmp=d, platform="darwin")[0])
-            for flag in ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena"):
+            for flag in ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena", "--expert-placement"):
                 self.assertIsNone(self.plan({**self.CFG, "args": ["--pack", "/p", flag]}, tmp=d)[0], flag)
             self.assertIsNone(self.plan({**self.CFG, "replicas": [{"gpus": [0], "args": ["--mmap-experts"]}, {"gpus": [1]}]}, tmp=d)[0])
             self.assertIsNone(self.plan({**self.CFG, "arch": "deepseek41"}, tmp=d)[0])

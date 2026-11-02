@@ -230,6 +230,7 @@ When the RAM cannot hold them beside the system (the experts plus about 10 GB), 
 | Mapped | `--mmap-experts` | Maps the experts from one file in the model's folder (the pack's `experts.bin`, +23-50 GB of disk), or from the GGUF files themselves for native packs that have no `experts.bin`. The OS file cache holds what the GPU does not and can give that memory back. With a small GPU most experts come from the SSD and it is much slower; setup says so. |
 | Resident | `--resident-experts` | When the experts the GPU does not hold fit the RAM, the engine copies exactly those into RAM at start. Nothing is read from the SSD while it answers. |
 | RAM budget | `--resident-budget-gib N` | The N GiB of experts the GPU does not hold that the profile ranks hottest are copied into RAM; the rest are read from the files. Implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows the available commit limit also caps N, and a clamped budget is reported. This is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) on a 64 GB PC. |
+| Partitioned | `--expert-placement partitioned` | Experimental: keeps the GPU and CPU primary sets disjoint, including during prompt-slot borrowing. Uses the static `--expert-profile` and available RAM, or an explicit `--resident-budget-gib N`. Experts outside both sets are read from the files. Temporary staging and Foresight copies use their existing budgets. |
 
 - In a source checkout, `START-HERE.bat --setup --low-ram on|off` overrides the choice, and `--low-ram resident|mmap` forces one variant.
 - The resident variant keeps 4 GB of the RAM it finds free (`STRATA_RESIDENT_HEADROOM_GIB`). When even the missing experts do
@@ -320,6 +321,33 @@ that reads this line must accept `ms/window = adapt wait` for a serial run.
 | `--spec N`, `--spec-min-p P` | Draft depth and the confidence needed to add a guess. Setup's default is `--spec 4 --spec-min-p 0.5`. |
 | `--draft-vocab en\|cyrillic\|fr` (setup) | The draft layer can only propose tokens from a subset of the vocabulary. The default subset includes every Chinese, Japanese and Korean token. `en` keeps the English and code subset (~110 MiB less VRAM, English 1-2% faster, CJK gets almost no drafts). `cyrillic` and `fr` add those scripts. `tools/draft_vocab.py` builds and inspects subsets. |
 | `--lookup-chain-min M`, `--mtp-hnorm stream`, `--mtp-draft-vocab FILE` | Finer controls: the shortest context match `--lookup-chain` extends (default 3), one norm per stream, and a token subset of your own. |
+
+Experimental three-level drafting is enabled with `--three-level` in the engine arguments. It supports Qwen3.6
+and Qwen3.8 on one CUDA GPU, one request at a time, with greedy text generation. The existing MTP weight arguments
+still apply. `--three-level-depth 3 --three-level-loops 6 --preverify-top-h 4` are the defaults; the candidate bound
+is `(depth + 1) * loops`, which must be at most 24. The final verification can read 25 input rows, independently of
+the batch limit. Depth and loops must be positive; top-h is 1..8 for Qwen3.6 and 1..10 for Qwen3.8.
+
+Every draft segment passes through a preliminary native verification. It computes the router's top-h experts and
+any other selected expert already ready in the GPU cache or Foresight slots, using the original routing weights.
+The final native verification checks all routed experts and alone confirms output tokens. Preliminary predictions
+stay private. `--expert-placement partitioned` can be combined with this mode, or used independently.
+The target uses complete native routing: resident-route bias, tail skipping and route priors are disabled.
+Qwen3.8 requires fully resident target KV; streamed or growing target KV is unsupported in this mode.
+Mutable branch state and verification scratch are allocated, and space for phase-specific graphs is budgeted,
+before sizing the expert cache. Qwen3.6 bounds its graph cache; if capture exceeds that budget, it logs the fallback
+and executes the same native window without a graph. The 25-row capacity is unchanged.
+
+The HTTP server reads the same engine arguments from the run config. Three-level mode defaults to temperature 0
+and rejects nonzero temperature, active sampling penalties, logit bias, logprobs, images and batch/multi-GPU
+configurations. Forced reasoning endings and forced tool-call openings are unsupported; the server's automatic
+answer-room reservation is disabled so it publishes only confirmed model tokens. Requests continue through the
+existing serial queue. Explicitly disabling MTP is an error.
+This experimental mode is off by default. The latest
+[RTX 5090 GSM8K/HumanEval comparison](../bench/results/2026-11-02-rtx5090-three-level/report.txt)
+measured higher throughput than AR and lower throughput than native two-level drafting. These warmed runs kept all
+routed expert weights in GPU/CPU memory; Qwen3.8 still read its PLE table from SSD. The report includes the fixed
+cache mapping, actual memory use, output lengths and per-request records.
 
 When the start stops with "the draft head does not fit" (a 12 GB card with a long context), the engine says how much it needs
 and which smaller subset fits. Setup suggests `--draft-vocab en` on cards under 14 GB; nothing changes unless you pass it.

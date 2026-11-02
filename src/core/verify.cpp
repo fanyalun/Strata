@@ -701,6 +701,9 @@ Verifier::~Verifier() {
     for (auto& row : exec_nr_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
+    for (auto& row : pre_exec_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -807,7 +810,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
-    if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+    if ((!transactional_ && (hits.d_res == nullptr || hits.cache_base == nullptr)) || hits.blob <= 0) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
               "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
@@ -855,7 +858,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped((size_t) strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
+              mapped((size_t) max_t * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
                      (void**) &m_nf_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
@@ -955,7 +958,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, (int) T)));   // 147-verify: 5-8 columns too
+        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in,
+            std::max(4, std::min((int) T, strata::kernels::kWindowMaxT))));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -968,6 +972,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
+        block_pos_snap_ = transactional_ ? b.take<int32_t>(nQ) : nullptr;
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -1742,7 +1747,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
                                                  slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
                     } else
-                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
+                    if (grp == 0) {
+                        copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
+                        if (transactional_) copy_i32_from_mapped(block_pos_snap_ + qi, st.idx_block_pos, 1, ns);
+                    }
                 };
                 auto idx_append = [&](cudaStream_t ns) {
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -2802,6 +2810,7 @@ bool Verifier::capture_commit(std::string& err) {
                 il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
                 il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
                 il.block_pos[nq] = st.idx_block_pos;
+                if (transactional_) copy_i32_from_mapped(st.idx_block_pos, block_pos_snap_ + qi, 1, cs_);
                 ++nq;
                 ++qi;
             }
@@ -2834,6 +2843,7 @@ bool Verifier::capture_commit(std::string& err) {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                if (transactional_) copy_i32_from_mapped(st.idx_block_pos, block_pos_snap_ + qsa_index, 1, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 if (!g_no_batch_kv) {
                     native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
@@ -3246,6 +3256,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        if (transactional_) {
+            const int K = (int) ss.k;
+            const int32_t* ids = h_ids_ + (size_t) tb * K;
+            active_routes_.assign((size_t) n * K, 1);
+            if (preverify_top_h_ > 0)
+                for (int i = 0; i < n * K; ++i) {
+                    const int e = ids[i];
+                    const bool ready = e >= 0 && e < g.n_expert && route_ready_ != nullptr &&
+                        route_ready_[(size_t) l * g.n_expert + (size_t) e] >= 0;
+                    active_routes_[(size_t) i] = (uint8_t) (i % K < preverify_top_h_ || ready);
+                }
+            sink_.active_routes = active_routes_.data();
+            if (route_observer_) route_observer_(l, tb, ids, h_w_ + (size_t) tb * K, n, K);
+        } else sink_.active_routes = nullptr;
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
@@ -3623,6 +3647,18 @@ bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
+    if (transactional_) {
+        // A rejected suffix may have replaced the moving spare with a completed block's key.
+        // Replay starts with the original spare, even when the accepted prefix completes no block.
+        const int64_t row = last_pos0_ / g_->idx_block;
+        for (int64_t q = 0; q < ss_->qsa_alloc; ++q) {
+            const auto& st = ss_->qsa_states[ss_->qsa_ord0 + q];
+            if (cudaMemcpyAsync(st.idx_pooled + row * g_->idx_key_dim, st.idx_dead,
+                                (size_t) g_->idx_key_dim * sizeof(float), cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                err = "verify: restoring the transactional indexer spare failed"; return false;
+            }
+        }
+    }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
@@ -4148,8 +4184,8 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
 bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     evicted = false;
     if (no_window_eviction_ || keep_t < 1) return true;
-    bool have[strata::kernels::kWindowMaxT + 1] = {};
-    const int top = std::min<int>(max_t_, strata::kernels::kWindowMaxT);
+    bool have[strata::kernels::kSequenceVerifyMaxT + 1] = {};
+    const int top = std::min<int>(max_t_, strata::kernels::kSequenceVerifyMaxT);
     for (int t = 1; t <= top; ++t) have[t] = (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t]) != nullptr;
     const int victim = strata::core::pick_window_victim(have, top, keep_t, prelaunched_);
     if (victim == 0) return true;
@@ -4310,7 +4346,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     using namespace strata::kernels;
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
     // whose hand-off buffers hold kVerifyNarrowT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
-    if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
+    if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), std::min(max_t_, kWindowMaxT), hbase,
                                            next_ != nullptr || lb_ > 0, handoff_rows_ > 0 ? handoff_rows_ : kVerifyNarrowT)) {
         err = why;
         return false;
@@ -4800,6 +4836,32 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
                  (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
+}
+
+bool Verifier::bind_transactional_hits(const VerifyHits& hits, std::string& err) {
+    if (!transactional_ || hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+        err = "verify: invalid transactional residency binding"; return false;
+    }
+    hits_ = hits; h_res_ = hits.h_res;
+    return true;
+}
+
+bool Verifier::prepare_transactional(int preverify_rows, std::string& err) {
+    if (!transactional_ || preverify_rows < 1 || preverify_rows > max_t_) {
+        err = "verify: invalid transactional graph widths"; return false;
+    }
+    set_preverify_routes(0, nullptr);
+    if (!capture_all(err)) return false;
+    struct KeepGraphs {
+        bool& flag;
+        explicit KeepGraphs(bool& value) : flag(value) { flag = true; }
+        ~KeepGraphs() { flag = false; }
+    } keep(no_window_eviction_);
+    set_preverify_routes(1, nullptr);
+    for (int t = 1; t <= preverify_rows; ++t)
+        if (!capture(t, err)) return false;
+    set_preverify_routes(0, nullptr);
+    return true;
 }
 
 bool Verifier::capture_all(std::string& err) {

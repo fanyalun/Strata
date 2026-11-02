@@ -70,7 +70,7 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 constexpr int kFusedGrMaxT = 8;
 /// A window of more than kFusedGrMaxT tokens is read in slices of at most kFusedGrMaxT (every token's outputs are
 /// strictly its own, so the slices are bitwise the one read); `a` and `xn_scratch` hold up to kFusedGrWideT tokens.
-constexpr int kFusedGrWideT = kWindowMaxT;
+constexpr int kFusedGrWideT = kSequenceVerifyMaxT;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);

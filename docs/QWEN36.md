@@ -22,6 +22,25 @@ strata launch --family qwen36 --model ud-q4_k_xl --vision on --parallel 2
 | `--vision on\|off\|gpu\|cpu` | Terminal: pictures and which reader. Source setup uses `--vision yes\|no\|gpu\|cpu` and `--vision-tokens N`. |
 | `--parallel N` | How many requests are answered at once, 1 to 8. Source setup has the same option. |
 | `--prefill 512` | Engine flag in the config's `args`, not a `strata launch` option: the prompt chunk size ([Prompt chunk](#prompt-chunk)). |
+| `--expert-placement partitioned` | Experimental engine flag: GPU and CPU primary expert sets are disjoint. CPU experts use available RAM, with the rest read from the GGUF. |
+| `--three-level` | Experimental CUDA engine flag: MTP drafts, preliminary native verification, then full native verification. Greedy text, one GPU and one request at a time. |
+
+With partitioned placement, `--resident-budget-gib N` caps the CPU's resident experts (GiB); `0` keeps them all on
+the file tier. Without an explicit budget the engine sizes the CPU set from available RAM after its buffers and
+staging are allocated, leaving 8 GiB of headroom. Experts promoted from CPU RAM exchange their place with an evicted
+GPU expert. Large prompt chunks use two temporary staging buffers. This path has been checked on CUDA with an RTX
+5090; HIP execution is unverified.
+Partitioned placement uses the same native file prefetch settings for AR and both speculative modes;
+`STRATA_IO_PREFETCH`, `STRATA_IO_PF_THREADS` and `STRATA_IO_STATS` override them. File-read counters printed at
+shutdown include initialization and every request. They count logical reads, which can be served by the OS cache.
+
+Three-level mode uses `--three-level-depth 3 --three-level-loops 6 --preverify-top-h 4` by default. It permits at most
+24 candidates and a 25-row final check; `(depth + 1) * loops` must be at most 24. The built-in MTP weights are required,
+and `--mtp 0` conflicts with this mode. The HTTP server accepts these options in the config's `args`, defaults to
+greedy, and queues requests serially. See [draft layer options](DETAILS.md#draft-layer) for the supported request
+settings. The existing batch limit and default inference mode are unchanged.
+`--mtp N` still selects the native two-level depth; in three-level mode, `--three-level-depth` selects it instead.
+Qwen3.6's preliminary verification uses ready hits from its main GPU cache; this engine has no Foresight slots.
 
 ## Pictures
 

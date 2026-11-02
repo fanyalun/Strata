@@ -1,0 +1,16 @@
+strata-q36: <ASSETS_DIR>/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf: 753 tensors (layout checked), 4.40 GiB on the GPU in 2.3 s (the routed experts are placed after the engine's buffers)
+strata: K-quant prompt kernels from <STRATA_ROOT>/build-three-level/libstrata_kq.so (STRATA_MMQ_KQ=1)
+strata-q36: prompt experts on MMQ (int8)
+strata-q36: context 512 cells, prompt chunk 128, MTP block loaded, 25.02 GiB of VRAM free
+strata-q36: every routed expert in VRAM (18.75 GiB) in 19.3 s
+strata serve: session 0: prompt 147 tokens = 0 reused + 147 read in 97 ms (1519.0 tok/s), 50 generated in 197 ms (254.2 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 139 tokens = 0 reused + 139 read in 34 ms (4055.2 tok/s), 231 generated in 927 ms (249.1 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 108 tokens = 0 reused + 108 read in 23 ms (4734.5 tok/s), 97 generated in 380 ms (255.5 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 142 tokens = 0 reused + 142 read in 36 ms (3978.0 tok/s), 152 generated in 607 ms (250.6 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 141 tokens = 0 reused + 141 read in 35 ms (4056.6 tok/s), 55 generated in 214 ms (256.6 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 117 tokens = 0 reused + 117 read in 24 ms (4975.8 tok/s), 59 generated in 229 ms (258.0 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 137 tokens = 0 reused + 137 read in 34 ms (4009.2 tok/s), 214 generated in 858 ms (249.4 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 117 tokens = 0 reused + 117 read in 23 ms (5031.9 tok/s), 19 generated in 71 ms (269.2 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 139 tokens = 0 reused + 139 read in 35 ms (3993.8 tok/s), 55 generated in 214 ms (256.9 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 123 tokens = 0 reused + 123 read in 24 ms (5174.8 tok/s), 62 generated in 241 ms (257.3 tok/s), drafts accepted 0 of 0 (stop)
+strata serve: session 0: prompt 173 tokens = 0 reused + 173 read in 40 ms (4375.2 tok/s), 172 generated in 691 ms (248.8 tok/s), drafts accepted 0 of 0 (stop)

@@ -1,0 +1,245 @@
+{
+  "normalization": {
+    "<STRATA_ROOT>": "repository root",
+    "<ASSETS_DIR>": "STRATA_BENCH_ASSETS",
+    "<BENCHMARK_DIR>": "this report directory"
+  },
+  "files": {
+    "ram_guard_exec.py": {
+      "bytes": 6665,
+      "sha256": "3cfe829e13a060bf2a6f6e83bfbd2eec355ad58fbdfee466c38ca5744207ebb2"
+    },
+    "results.json": {
+      "bytes": 34759,
+      "sha256": "5d297d9563100c562caeeb3b37c7a293d6aeb621dd3ff5a5e186c81d17a2ff1d"
+    },
+    "dataset-licenses.txt": {
+      "bytes": 2374,
+      "sha256": "29b55e08ba8d42b42a39feff25edc3ffc91d5eeb67d90e414bf61b0b4e5ae143"
+    },
+    "metrics_q36.py": {
+      "bytes": 5477,
+      "sha256": "38acda4f06ff41aceeac8ca0effcce00a3141bed9cc030954d9451698ea36c95"
+    },
+    "benchmark_q38_dataset.py": {
+      "bytes": 29230,
+      "sha256": "9283af01299e254100cfc5580a48b2b66bbf33d0a0c8485a616de291cc34eb68"
+    },
+    "benchmark_q36_dataset.py": {
+      "bytes": 17239,
+      "sha256": "8fba4a75587dc62faefeb0825503aac6a4dc97d4f3d25f9ab08d8d5dfff8506c"
+    },
+    "manifest.json": {
+      "bytes": 5851,
+      "sha256": "5462246e15f6f09b6f1fd9791ff27f4e72655aea07f39f3a36beaf13130a63da"
+    },
+    "models.json": {
+      "bytes": 1610,
+      "sha256": "4d7b44a8e08d64f015563c7a3dc7d169ec371fec7e18c77203fd33d69cc1a1bc"
+    },
+    "metrics_q38.py": {
+      "bytes": 6752,
+      "sha256": "78e909938353f4bd315fe16ffa2d034b323f39b88d6dd33afd7c928fd4766a6c"
+    },
+    "report.txt": {
+      "bytes": 6173,
+      "sha256": "7256b83d3138374a74bc9113f2b27c68ae2e2630710522db8a935454a8362b6a"
+    },
+    "tokenizer_tools.py": {
+      "bytes": 854,
+      "sha256": "2ebc3ef2c7386c1bc5feea355b5f3b5e408e81c8fae012b69eadd6ef0690f9c3"
+    },
+    "inputs.jsonl": {
+      "bytes": 58910,
+      "sha256": "72b8f1bde0277e3ad85e2bf8a6a15c75cb63f3ab4f87fde72c7c2d312d700bd1"
+    },
+    "provenance.json": {
+      "bytes": 5117,
+      "sha256": "5576e33379e1662f14b638c19a9779d68c7ef4635552339f3792a211b4edce6f"
+    },
+    "validation/file-source-rotation.log": {
+      "bytes": 5518,
+      "sha256": "d9a391c21c7316ec77426080b82d439e9192113d67e8cc5cf1f7754e346209a7"
+    },
+    "validation/cuda16-parity.log": {
+      "bytes": 1043,
+      "sha256": "6f65b4933e30822650069b379d7723e76bdf5ce7dd24a0493c894d850f419991"
+    },
+    "validation/exchange-failure.json": {
+      "bytes": 5092,
+      "sha256": "d2beda09f8cd5f0abaebc10a19d36f1256e73910739ee08639e1f1ad133cdfdb"
+    },
+    "validation/build-main.log": {
+      "bytes": 2347,
+      "sha256": "2c8cc73596e300d119710b01ecbb50125030a7b69b2a0f55cff33828086a3041"
+    },
+    "validation/build-cuda16.log": {
+      "bytes": 2347,
+      "sha256": "2c8cc73596e300d119710b01ecbb50125030a7b69b2a0f55cff33828086a3041"
+    },
+    "validation/http-regression.log": {
+      "bytes": 264,
+      "sha256": "e52045ac6d38c9dc8d4a2836cc2a01cee95a57cbfbac940f58e77b76e9b0e319"
+    },
+    "validation/cuda8-parity.log": {
+      "bytes": 1127,
+      "sha256": "4efe4f7416ff23c84da57b0038ff9bc0fbcd8fa4462c4fbadd0325cab9bcce96"
+    },
+    "validation/q36-all-hit-shapes.json": {
+      "bytes": 6886,
+      "sha256": "f08524a55d9230a3c385435b6fa9ee156d9255be8f44d0cf614b8002ce6f88b5"
+    },
+    "runs/q36/gsm8k-ar.protocol.log": {
+      "bytes": 26492,
+      "sha256": "e173ca70be057ed464e498fc9825c42aab640b6cdb73a13a129f020dab264b8b"
+    },
+    "runs/q36/gsm8k-ar.stderr.log": {
+      "bytes": 2232,
+      "sha256": "8c7b48ddd2aaf635dbd3c3482b5ff7e25e1d733362fd7b757632086e8db21271"
+    },
+    "runs/q36/gsm8k-three_level.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "cebd1d365ecc4cfd8fb950f0e5b9290cccf09e7256a0f5e524e9f59e26d27d36"
+    },
+    "runs/q36/gsm8k-two_level.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "a06b72cca1d8b1f33f2c7021719067a302660d74ef17adebe45c2e3b6d624c00"
+    },
+    "runs/q36/humaneval-ar.protocol.log": {
+      "bytes": 17626,
+      "sha256": "78390a4713d255616aaac7f166d854152c9f79a17e9f47a1c0182c2c6ad3ede8"
+    },
+    "runs/q36/humaneval-three_level.stderr.log": {
+      "bytes": 2494,
+      "sha256": "a1239a7c350ed175b082efb5c2fadb204296c3a882516632f1441c60db2a1c8f"
+    },
+    "runs/q36/humaneval-three_level.ram-guard.json": {
+      "bytes": 715,
+      "sha256": "e2a3eb134cd6bf16de2223d493f5b9e13cbbeb4378673e74d62508e7c9f66412"
+    },
+    "runs/q36/gsm8k-two_level.protocol.log": {
+      "bytes": 26528,
+      "sha256": "a4446411ee0f8ce03af11e68be2b2c282ea64c5fe94c11da7df3bee82251dfc8"
+    },
+    "runs/q36/humaneval-two_level.protocol.log": {
+      "bytes": 17656,
+      "sha256": "9405e5e0de8d0d63fd39f2702f8d9973a05ad79358b623e89b276600060cc454"
+    },
+    "runs/q36/results.json": {
+      "bytes": 492394,
+      "sha256": "cd9cdf78fcf93d3883f02e52715612a673b6ac82a0a182aefce472947289ac84"
+    },
+    "runs/q36/gsm8k-ar.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "41fea984cc180a1592a1655289dab134caebb8f0331e0b48789885912067483d"
+    },
+    "runs/q36/gsm8k-two_level.stderr.log": {
+      "bytes": 2268,
+      "sha256": "ca9debfaa879ad50b2f266d45ae42c13d43284d8a2661091b64d6d8cfcac609f"
+    },
+    "runs/q36/humaneval-three_level.protocol.log": {
+      "bytes": 17656,
+      "sha256": "74921d3bd18bb384bdf54070195a98a89677c5e400d4bb528d79d5954d9f9cf1"
+    },
+    "runs/q36/gsm8k-three_level.stderr.log": {
+      "bytes": 2515,
+      "sha256": "a220299ebcfa24219a23ab63203e5d291932a296dead654cb0d94a3b50aace2d"
+    },
+    "runs/q36/gsm8k-three_level.protocol.log": {
+      "bytes": 26528,
+      "sha256": "ff2a2b0699c06d1cc0cb8ef340ba7d4b70340bf5f93e03c7b6ad426c1ea1c6e8"
+    },
+    "runs/q36/humaneval-two_level.stderr.log": {
+      "bytes": 2249,
+      "sha256": "9e45a7acf142bb018f5539d70616edc7c65abd24b5ffef4776e1611af3cb6868"
+    },
+    "runs/q36/humaneval-two_level.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "d2310397d0f85cf0561c85abf6b8a90ae2781b2f6b2f6683e5dee9f762d617fa"
+    },
+    "runs/q36/humaneval-ar.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "38d54afae44a9be72600cd685ef764dd27030f770f256565b417934932f130c8"
+    },
+    "runs/q36/humaneval-ar.stderr.log": {
+      "bytes": 2219,
+      "sha256": "1314da9086c9bb1a8993b00572241ceb98e1997c12115af6158bd16da2da095c"
+    },
+    "runs/q38/gsm8k-ar.protocol.log": {
+      "bytes": 26910,
+      "sha256": "8b9e24dad146a4970835e9282cc9304d060bab121282af4786bb558fa0a0f57a"
+    },
+    "runs/q38/gsm8k-ar.stderr.log": {
+      "bytes": 20789,
+      "sha256": "d80b126efbeb5eee32876fc57b7c17edf07557d00b7bb4ac51e49edf6a214f63"
+    },
+    "runs/q38/gsm8k-three_level.ram-guard.json": {
+      "bytes": 715,
+      "sha256": "9c2157227a0c214a531f961352e3ca48eabeaa29724896e0c9fd961c091fd5c2"
+    },
+    "runs/q38/gsm8k-two_level.ram-guard.json": {
+      "bytes": 715,
+      "sha256": "1e7decd66366dcdef7d0dba90becbf72d7f7fe77edef03a1f57399fe4560ee57"
+    },
+    "runs/q38/humaneval-ar.protocol.log": {
+      "bytes": 23236,
+      "sha256": "177702796dbc52a239f015ce2e6e49225f0e12ecbe15bfab5d22be4249c65031"
+    },
+    "runs/q38/humaneval-three_level.stderr.log": {
+      "bytes": 26154,
+      "sha256": "40cece379342cc7555681d7d35b4d049a07d48742992b439c910c0a43515d920"
+    },
+    "runs/q38/humaneval-three_level.ram-guard.json": {
+      "bytes": 715,
+      "sha256": "12874a6edc04bee292c7e8036cb5dc73d07951f7b4d9e7d6b6ef8754a20787fe"
+    },
+    "runs/q38/gsm8k-two_level.protocol.log": {
+      "bytes": 26960,
+      "sha256": "3196f2fc3422ca6df49949222cc0a9bb78ae7446b8a171e81a96b9917bb6f04d"
+    },
+    "runs/q38/humaneval-two_level.protocol.log": {
+      "bytes": 23270,
+      "sha256": "baa6ac7d2caf075cd91cbe4d2dcfb57bdba450e340c317508ec34c91db499c12"
+    },
+    "runs/q38/results.json": {
+      "bytes": 695927,
+      "sha256": "72d336db2e2ff0f3e0ee39904ce3c4fc9252c22fb95f842e7e95359848df0dd7"
+    },
+    "runs/q38/gsm8k-ar.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "b941a60e140291ac8dc88995482d18e55effe7cda95ae966a35880afb64e24e4"
+    },
+    "runs/q38/gsm8k-two_level.stderr.log": {
+      "bytes": 20939,
+      "sha256": "19387ab6c04800941671f5ea70b0e35c526bc70ddae5878976c89cd7adc94859"
+    },
+    "runs/q38/humaneval-three_level.protocol.log": {
+      "bytes": 23287,
+      "sha256": "2daed977ede68081a154f5feff5367dc3342fdb72e0e5ba14c4cae0b8bc27d56"
+    },
+    "runs/q38/gsm8k-three_level.stderr.log": {
+      "bytes": 26174,
+      "sha256": "990004f958b34ad36b2382b2f170b21257695592a474b6865593c826e5da89b6"
+    },
+    "runs/q38/gsm8k-three_level.protocol.log": {
+      "bytes": 26965,
+      "sha256": "7d700fdd57b3fc400bf1ca29ab2f491404c1ae73471790c9e2ea9dce7a9f091a"
+    },
+    "runs/q38/humaneval-two_level.stderr.log": {
+      "bytes": 20770,
+      "sha256": "9917aa284a9d190d2f38aa3377a7471ee9cb53bdd963ddeeee933f910a22b431"
+    },
+    "runs/q38/humaneval-two_level.ram-guard.json": {
+      "bytes": 715,
+      "sha256": "e069f6c0aa06bfc9e4c81b23edc12b64e60b9569b4956dab4c4e046de5d47bfc"
+    },
+    "runs/q38/humaneval-ar.ram-guard.json": {
+      "bytes": 716,
+      "sha256": "74c4d8986bfecf4bd87e9bcb1faa437bc8a7342695cb99f84824ab20da7bf30a"
+    },
+    "runs/q38/humaneval-ar.stderr.log": {
+      "bytes": 20492,
+      "sha256": "9ab3af70a1a6abbaaa21dda0bc573e388e40c5ea5746041e542a26c5ea47d097"
+    }
+  }
+}

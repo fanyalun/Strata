@@ -1,0 +1,89 @@
+Strata three-level speculative decoding: RTX 5090
+
+Latest performance matrix (decode tokens/s)
+model / dataset             AR       native two-level    three-level
+Qwen3.6 UD-Q4_K_XL / GSM8K   251.45   486.66               309.56
+Qwen3.6 UD-Q4_K_XL / HumanEval 252.18  501.34               315.52
+Qwen3.8 IQ2_XS / GSM8K       125.72   219.46               154.50
+Qwen3.8 IQ2_XS / HumanEval   117.84   205.03               150.96
+
+Rate = total generated tokens / total native decode seconds across eight samples.
+Loading, prompt ingestion, calibration and three warmup samples are excluded.
+Native two-level is fastest in all four groups. Three-level improves over AR by
+23-28% on this selection. Each sample ran once per mode; this is not repeated-run
+variability or a general speed claim. Per-sample values are in runs/ and results.json.
+
+Hardware: RTX 5090 32607 MiB, Core Ultra 9 285K (24 cores), 62.14 GiB RAM,
+CUDA 13.0.88, NVIDIA driver 610.43.02, CUDA sm_120 Release build.
+Base revision: c62d5e3a15b40ea51c96aae9e8d36928965f53ab plus this feature.
+Exact model revisions and hashes: models.json. Dataset provenance: manifest.json.
+This is a custom experiment, not the draft standard benchmark protocol.
+
+Workload and settings
+- Official test-file order, indices 0-2 warmup, 3-10 timed for each dataset.
+- Each model/dataset/mode uses a fresh process and 3 warmups followed by 8 timed
+  requests. Total: 96 timed requests and 36 warmups. All outputs match same-model,
+  same-run AR token-for-token, including warmups. No accuracy/pass@1 claim.
+- Greedy without penalties. max_new=256 with natural EOS, not forced 256 output.
+  Context 512, prefill/chunk 128, single CUDA GPU, one serial request at a time.
+- Three-level: depth=3, loops<=6, top-h=4; max 24 candidates / 25 input rows.
+  Native two-level: max 3 draft tokens. Adaptive draft length is off.
+- Explicit shared chat wrapper with empty closed think prefix; no system message.
+  GSM8K uses the original question; HumanEval adds a function-completion request
+  and preserves the original prompt. No answer, solution or tests are in input.
+- Qwen3.6: all 256 experts per layer in VRAM, 18.75 GiB including MTP experts;
+  CPU expert complement 0. Packed copies retained, no hybrid or Graph fallback.
+- Qwen3.8: auto-calibrated cache budget request 17613, actual 18445 profile slots,
+  about 24.78 GiB on GPU and 8.25 GiB CPU expert complement. All target experts fit
+  the GPU/CPU sets; PLE still uses SSD direct reads. This does not measure SSD
+  expert-offload benefits. Cache mapping is fixed across all three modes.
+- Adaptive expert swaps and Foresight are off. IO prefetch on, 2 IO threads.
+- Before each engine, target-model-only advisory DONTNEED; then load and warm up.
+  No global cache drop, full-model cache-warming pass or competing GPU workload.
+- 50 GiB total DRAM target is a soft budget, not a cgroup hard cap. A 50 ms
+  watchdog stops at RSS 48 GiB, system MemAvailable below 8 GiB, or engine swap.
+  CPU expert budget is 32 GiB, capped by the actual non-GPU complement.
+- Peak process RSS/HWM: Q36 23.321 GiB, Q38 26.854 GiB. Sampled full-device VRAM
+  peaks: Q36 25.842 GiB, Q38 31.172 GiB. No engine swap or system swapout increase.
+  VRAM sampling includes driver/loading and can miss short peaks. RSS includes
+  mapped pages but does not include every unreferenced OS file-cache page.
+
+Validation
+- Q36 Pre router uses compact rows; the shared-gate column is retained only for
+  the native fused Full/legacy route. 22 all-hit Pre and 22 Full shapes match
+  native single-row picks and complete valid GDN/conv/KV/seed state bytes.
+- Existing CUDA parity: 9 tests at batch8 and 8 at batch16 passed; CPU expert jobs
+  remain limited to 8 rows. Both engine entry binaries built at batch8 and16.
+- HTTP regressions: 146 tests and 1035 subtests passed. File-source/GPU rotation,
+  explicit layout, complementary residency and Foresight lifecycle passed.
+- HIP, SYCL and Metal were not built or executed: toolchains unavailable.
+- Q38 was measured before relinking the Q36-only host fix into the combined
+  executable. Q38 sources were unchanged; the actual measured hash is preserved
+  in provenance.json. Q36 measurements use the corrected executable.
+- After the measurements, a Q36 failure-only safety fix prevents reuse of a GPU
+  slot after an interrupted expert exchange. The service drains and exits with
+  stdin still open; a queued next request is not executed. Normal consecutive
+  requests still match the saved AR tokens. Both builds passed. This path is
+  inactive in the full-GPU/fixed-placement matrix. The measured binary hashes
+  are retained rather than relabeled as the later safety build.
+- Path-normalized native logs, protocol lines, commands, environment, guard logs,
+  actual token lengths and full outputs are retained. Native IO reports include
+  loading/warmups; per-request physical storage read bytes come from /proc/PID/io.
+
+Replay
+Build as recorded (same weights/pack/profile/tokenizers required):
+  cmake -S . -B build-three-level -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+    -DSTRATA_BUILD_TESTS=ON -DSTRATA_MMQ_KQUANTS=ON \
+    -DSTRATA_GGML_DIR=<path-to-pinned-llama.cpp>
+  cmake --build build-three-level --target strata strata-q36 -j 4
+  export STRATA_BENCH_ASSETS=<asset-directory>
+  python3 bench/results/2026-11-02-rtx5090-three-level/benchmark_q36_dataset.py --action calibrate
+  python3 bench/results/2026-11-02-rtx5090-three-level/benchmark_q36_dataset.py --action benchmark
+  python3 bench/results/2026-11-02-rtx5090-three-level/benchmark_q38_dataset.py --action calibrate
+  python3 bench/results/2026-11-02-rtx5090-three-level/benchmark_q38_dataset.py --action benchmark --calibration <results-from-calibrate>
+Run serially with an otherwise idle GPU. Optional STRATA_BENCH_REPO and
+STRATA_BENCH_BUILD override repository and build paths. The committed inputs are
+already encoded. Portable collectors retain measurement logic and only change
+path/helper configuration; packaging checks are not additional GPU measurements.
+Pinned llama.cpp revision: 3cf03257f219afbe7334045ff7c6a06ac68c627d.

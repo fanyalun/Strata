@@ -1,0 +1,53 @@
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: mapped pinned cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s; page-locked and mapped
+FileExpertSource: room for the complement: 57.40 GiB (57.65 GiB available RAM minus 0 GiB headroom and a 0.25 GiB margin)
+FileExpertSource: RAM budget 57.40 GiB: 0 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: locked resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: mapped pinned cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s; page-locked and mapped
+FileExpertSource: exchange buffer rotation enabled: 2 buffers in 1 block sizes (largest 1382400 bytes, 0.00 GiB page-locked); no host commit memcpy
+FileExpertSource: room for the complement: 57.41 GiB (57.66 GiB available RAM minus 0 GiB headroom and a 0.25 GiB margin)
+FileExpertSource: RAM budget 57.41 GiB: 0 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: locked resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB pageable resident cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: pageable resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: exchange rotation unavailable; retaining copy path: requires a fully mapped/pinned RAM complement
+FileExpertSource: room for the complement: 57.41 GiB (57.66 GiB available RAM minus 0 GiB headroom and a 0.25 GiB margin)
+FileExpertSource: RAM budget 57.41 GiB: 0 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: pageable resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: mapped pinned cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s; page-locked and mapped
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: mapped pinned cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s; page-locked and mapped
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: mapped pinned cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s; page-locked and mapped
+FileExpertSource: RAM budget 0.00 GiB: 2 of the 0.00 GiB of experts the GPU cache does not hold, by profile rank; the rest are read from the files
+FileExpertSource: allocating 0.00 GiB pageable resident cache complement
+FileExpertSource: copied cache complement through layer 1/1 (0.00 GiB, 0 s)
+FileExpertSource: pageable resident cache complement ready: resident 0.00 GiB, pinned 0.00 GiB in 0 s
+io prefetch: 0 read ahead, 0 used, 300 skipped, pread 0 B: bytes PASS
+rotation integration: rotate=0 pinned=1 exchanges=64 commit_ms=5.89315 exact_bytes=PASS
+rotation integration: rotate=1 pinned=1 exchanges=64 commit_ms=0.001896 exact_bytes=PASS
+rotation integration: rotate=1 pinned=0 exchanges=64 commit_ms=3.26471 exact_bytes=PASS
+foresight exchange (commit_exchanges): dropped 1, foresight swap: 4 experts served from the swap space, 2 copies (0 from the router look-ahead), 4 not landed yet, 2 no free slot, 0 over budget, 1 dropped by exchanges, verified 3 ok / 0 BAD: PASS
+foresight exchange (commit_copies + commit_flip): dropped 1, foresight swap: 4 experts served from the swap space, 2 copies (0 from the router look-ahead), 4 not landed yet, 1 no free slot, 0 over budget, 1 dropped by exchanges, verified 3 ok / 0 BAD: PASS
+replace_resident_staged: pinned=1 exact_bytes=PASS
+replace_resident: pinned=1 exact_bytes=PASS
+replace_resident_staged: pinned=0 exact_bytes=PASS
+replace_resident: pinned=0 exact_bytes=PASS
+file_expert_source_test: PASS

@@ -1,6 +1,6 @@
 // src/kernels/kv_window_parity.cpp - the verify window's KV calls on a STREAMED layer, as the engine makes them (GPU, no model).
 //
-// kv_stream_parity appends one cell per call. The engine's verify window (and the MTP drafter's catch-up) appends n = 2..6
+// kv_stream_parity appends one cell per call. The engine's verify window (and the MTP drafter's catch-up) appends up to 25
 // cells in ONE launch (kv_append_*_steps, a 3D grid with the host copy as a kernel argument), resolves the n selections
 // together, attends n queries in one batched launch, and does all of it inside a captured graph on a non-blocking
 // stream. This test drives exactly that sequence for each KV format on a layer that must evict, and on a ring over a host
@@ -17,6 +17,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -52,7 +53,7 @@ HostBuf halloc(size_t bytes) {
     return b;
 }
 
-constexpr int kMaxWin = 6;   // --spec 4 windows are <= 5 tokens, the drafter's catch-up T <= 6
+constexpr int kMaxWin = k::kSequenceVerifyMaxT;
 
 // One KV array of a pool set: the pointer (device or host-mapped), the host-readable twin, bytes per page (block).
 struct Arr {
@@ -141,9 +142,9 @@ void fail(const char* fmt_name, const char* what, long long a = 0, long long b =
 bool run(int fmt, bool graphs) {
     const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : "int8";
     k::QsaShapes s = k::qsa_real_shapes();
-    const int64_t N = 40000, n_blocks = (N + 3) / 4;
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
-    const int64_t n_slots = kMaxWin * (cap / 4 + 2) + 700;   // holds one window's selections; far fewer than n_blocks
+    const int64_t n_slots = kMaxWin * (cap / 4 + 2) + 700;   // holds one window's selections, then forces eviction
+    const int64_t N = std::max<int64_t>(40000, (n_slots + 700) * 4), n_blocks = (N + 3) / 4;
     const int64_t R = 1500;                                  // the drafter-like ring
     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head;
     std::mt19937 rng(11 + 5 * fmt + graphs);
@@ -223,8 +224,10 @@ bool run(int fmt, bool graphs) {
     std::vector<float> a((size_t) kMaxWin * NH * D), b2((size_t) kMaxWin * NH * D);
     int windows = 0, attended = 0;
     int64_t pos = 0;
+    const int widths[] = {1, 4, 8, 9, 16, 17, 24, 25};
     while (pos < N) {
-        const int n = (int) std::min<int64_t>(N - pos, 1 + (int64_t) (rng() % kMaxWin));
+        const int width = windows < 8 ? std::min(kMaxWin, widths[windows]) : 1 + (int) (rng() % kMaxWin);
+        const int n = (int) std::min<int64_t>(N - pos, width);
         for (int j = 0; j < n; ++j)
             for (int64_t i = 0; i < H * D; ++i) {
                 hk[j * H * D + i] = nd(rng) * (((pos + j) % 17 == 0) ? 30.f : 1.f);

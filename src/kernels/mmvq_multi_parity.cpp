@@ -30,6 +30,7 @@
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -72,7 +73,7 @@ uint16_t sane_half(std::mt19937& rng) {
 }
 
 // T = 4 is the last width where the two layouts coincide, T = 5 the first where they differ
-const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 8};
+const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 8, 9, 16, 17, 24, 25};
 constexpr int COINCIDE_MAX_T = 4;
 
 bool ck(cudaError_t e, const char* what) {
@@ -186,6 +187,7 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
     for (const Case& c : CASES) {
         long long case_wide = 0;
         for (int T : WIDTHS) {
+            if (T > strata::kernels::kSequenceVerifyMaxT) continue;
             long long nf = 0, dfin = 0;
             bool ran = false;
             const long long diff = compare(c, T, s, nf, dfin, ran);

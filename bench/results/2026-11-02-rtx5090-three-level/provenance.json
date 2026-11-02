@@ -1,0 +1,61 @@
+{
+  "base_revision": "c62d5e3a15b40ea51c96aae9e8d36928965f53ab",
+  "measured_engine_source_sha256": {
+    "CMakeLists.txt": "09c1305e8744238f013a361e33a12fecdaff7d0419e4d8c56ae308765764e4d2",
+    "docs/DETAILS.md": "def2f8d07a02bb76a1eec514d3488c6e80fcc16191f24a64879d7e85c9c66af0",
+    "docs/QWEN36.md": "8bf74529453ad2f3070c805f1d733858d460a38124672b366e5d85ce575c0740",
+    "include/strata/core/expert_source.hpp": "21592df2014822ffbeb029045ce07816589ae976fd02ee6f5aec7c264f2b02c8",
+    "include/strata/core/foresight_swap.hpp": "9376414b5dc67968d0dfd13de16b204649775c47a78988cc3b180dd87abb6e0e",
+    "include/strata/core/mtp.hpp": "7c78078d37083df6639aff2625215721ad89d7b405054d471234fc7d5b545987",
+    "include/strata/core/verify.hpp": "7ea8d138f83ec740085e606104b3cd22216498f93c4a384b6d9f59089a095622",
+    "include/strata/kernels/fused_gr.hpp": "d9730a3bcfb96dc05d6cee1c65e1d404d7ac1203106a0e1d3f1aa5d3af8b016a",
+    "include/strata/kernels/s2_expert_grouped.hpp": "34269e69d48fd6747f6980323c539ec31d0bd7b8997d2dc5aed99c14d12f4b07",
+    "include/strata/kernels/verify_kernels.hpp": "878f1787fc394404066b6410c887e703ce28be7c61427894f1260b2df9f4893d",
+    "include/strata/kernels/window_limits.hpp": "5e483df44f1340dd263158b17bec9b757a412fd09b0bbc9238eeb608db030287",
+    "serve/replicas.py": "3a8431990367c72cfaddba7eda5e3611090b80ecbfce2c297b6c6680cf2b0c70",
+    "serve/server.py": "087f567954ba214f073396e85db5b04d6d7fbfa5b4731f33b8f6626fa378912e",
+    "serve/test_draft_layer.py": "5f431434a5b117e5a821a6fcaaf2075c1cb1ba3ba27a24c63c50f8133b42b267",
+    "serve/test_model_card_sampling.py": "7d0966363f996255aced98be5739ed676886bc54169be3af06e6dcde7af9a52f",
+    "serve/test_replicas.py": "257a7f9f07ee0e0cb5814d451b67387a5a211f1c08c16e08cd290c7cbe1d4562",
+    "src/core/expert_source.cpp": "2ba49237ef1e4541aebf3dca7c1d92130cc70d759a8c9ad618f6ad328c75c070",
+    "src/core/mtp.cpp": "1e39f05c0edd1dc2ba64ea45370c1e14169010df159be1099cf241f6c854e0c9",
+    "src/core/verify.cpp": "f949bfa459348e2a3fb589284f363f579e34b9cbef9f4ad69bc25c7f488070ec",
+    "src/core/window_limits_test.cpp": "ea745376a3f2f86ccaed9c5db376fc2132fa79dc8ce318378ac41dfedb6d1a47",
+    "src/kernels/cuda/native_bf16.cu": "8366e4882aa961ffe131633958d2713a73f37bbc8f55099f4a2dc0036e39d7cf",
+    "src/kernels/cuda/native_mmvq.cu": "b6049d2321b57c7637b8712acfc2c2165b92ada73e25e9a4f1b475b84f9fcaba",
+    "src/kernels/cuda/s2_expert_grouped.cu": "48e5b0cad12d92ec65bae552849c2ad8073b07f3a0b7f2101140d9accb9fb985",
+    "src/kernels/cuda/verify_kernels.cu": "5c0d900a458cb10e3565e067a070a5cd9ac04a54fa4782389b85555a84e424a1",
+    "src/kernels/kv_window_parity.cpp": "9fd03d7c94546d60e0962dd319f38d7f0cdb569da98c2479e5408a121e875f42",
+    "src/kernels/mmvf_rows_parity.cpp": "86c855408d14d9f3adfa8a96378411653c47c08a1e7af8b5a6da01faaf20690a",
+    "src/kernels/mmvq_multi_parity.cpp": "28a3beac2d47fe23b5838f8e0583002954085aa2fed495da85fbff545dd113d4",
+    "src/kernels/s2_expert_grouped_parity.cpp": "959843d69850a57e16000fab1b7f9f4d5b2e62763b739035f7b5ffc060736632",
+    "src/program/generate.cpp": "1f4f26be9af0e362ee6c69f51ecabfeb0376b925059f30cf1b043fef18fa9a16",
+    "src/qwen35/q36_engine.cu": "dfb1c096ab7221ee86759a6960bccd0d1aad5ba89dbffec1f9df43708419505a",
+    "tests/core/file_expert_source_test.cpp": "202bf06c92a47cf344309a4a2a9bd81a14ff7e2befbaec418788a19c160c261d",
+    "include/strata/core/three_level.hpp": "caa6b0edd6462279fbd9f51e00e9f48f7bc695e9f7952c05578cc995c082dfac"
+  },
+  "measured_binary_sha256": {
+    "q36": "60ce1e212bec8fda78c724a7b422f36bfd737f295d014b3bc84a577f1efffab0",
+    "q38": "df30816be002e8302f52fdf2d1f5ae6ada3c112ce7e0bfd56aeb0d62d29df4a3"
+  },
+  "original_measurement_files": {
+    "runs/q36/results.json": {
+      "sha256": "c0d6b08b492ea1a8e74759394155ad809c32a9758d2df3afbb75123c51fc8332",
+      "export": "runs/q36/results.json"
+    },
+    "runs/q38/results.json": {
+      "sha256": "e1671ddec6bdad34340a0a6c3c60e8755479edfae22999506bc8d07170d8de86",
+      "export": "runs/q38/results.json"
+    }
+  },
+  "export_transform": "Paths normalized only; numeric measurements, prompt/output token IDs, text, ordering and native timing lines retained.",
+  "q38_binary_note": "Q38 was measured before relinking a Q36-only host router fix into the combined executable; Q38 sources were unchanged. Its recorded binary hash is retained.",
+  "portable_scripts_note": "Measurement logic is retained; repository, build, asset and helper paths are parameterized for replay. Packaging checks do not constitute another performance run.",
+  "post_measurement_safety_fix": {
+    "scope": "Q36 incomplete expert exchange now latches fatal state, drains and exits before the next request; stdin reader lifetime/stdio synchronization support prompt shutdown. Fixed-placement measurement path did not perform exchanges.",
+    "validation": "validation/exchange-failure.json",
+    "final_q36_binary_sha256": "b48e56e60778145082ac58a6ccb639a5bd10794eef00b6ba2471af12aaca20a0",
+    "final_q36_source_sha256": "5f78d1f2cab9824f39dcd691da52c49f58e33abcd680d1d093f366751e4f0035",
+    "measurement_hashes_preserved": true
+  }
+}

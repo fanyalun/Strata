@@ -14,6 +14,9 @@
 #ifndef STRATA_VERIFY_MAX_T
 #define STRATA_VERIFY_MAX_T 8
 #endif
+#ifndef STRATA_SEQUENCE_VERIFY_MAX_T
+#define STRATA_SEQUENCE_VERIFY_MAX_T STRATA_VERIFY_MAX_T
+#endif
 
 namespace strata::kernels {
 
@@ -21,7 +24,11 @@ namespace strata::kernels {
 inline constexpr int kVerifyNarrowT = 8;
 /// The most rows one window can hold in this build (8 or 16).
 inline constexpr int kWindowMaxT = STRATA_VERIFY_MAX_T;
+/// Independent single-sequence capacity; batch layouts keep kWindowMaxT.
+inline constexpr int kSequenceVerifyMaxT = STRATA_SEQUENCE_VERIFY_MAX_T;
 
 static_assert(kWindowMaxT == 8 || kWindowMaxT == 16, "STRATA_VERIFY_MAX_T is 8 or 16 (the wide kernels are built for 16)");
+static_assert(kSequenceVerifyMaxT >= kWindowMaxT && kSequenceVerifyMaxT <= 25,
+              "single-sequence verification holds at most 25 rows");
 
 }  // namespace strata::kernels

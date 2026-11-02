@@ -24,6 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -3054,12 +3055,14 @@ void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, std::min(ncols, MAX_NCOLS));
+    if (ncols > strata::kernels::kSequenceVerifyMaxT) throw std::invalid_argument("native q8_1 sequence is too wide");
     return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, std::min(ncols, MAX_NCOLS));
+    if (ncols > strata::kernels::kSequenceVerifyMaxT) throw std::invalid_argument("native q8_1 sequence is too wide");
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_stream(stream);
@@ -3074,7 +3077,8 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, std::min(ncols, MAX_NCOLS));
+    if (ncols > strata::kernels::kSequenceVerifyMaxT) throw std::invalid_argument("native q8_1 sequence is too wide");
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);

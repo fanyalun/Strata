@@ -98,7 +98,7 @@ ARENA_PREFIX = "strata-replicas-"
 _MEMFDS: dict = {}                   # the memfds this server created: path (/proc/<pid>/fd/<n>) -> fd
 ARENA_MIN_RAM = 8 << 30              # a memfd arena: at least this much free RAM to try (the engine reserves the real size)
 ARENA_MIN_FREE = 8 << 30             # /dev/shm must have at least this much free to try (the engine reserves the real size)
-ARENA_INCOMPATIBLE = ("--mmap-experts", "--resident-experts", "--shared-expert-arena", "--resident-budget-gib")
+ARENA_INCOMPATIBLE = ("--mmap-experts", "--resident-experts", "--shared-expert-arena", "--resident-budget-gib", "--expert-placement")
 
 
 def _pid_alive(pid: int) -> bool:

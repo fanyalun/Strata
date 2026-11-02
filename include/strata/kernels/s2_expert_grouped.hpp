@@ -102,7 +102,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                     const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream);
-#if STRATA_VERIFY_MAX_T > 8
+#if STRATA_SEQUENCE_VERIFY_MAX_T > 8
 /// The same for a window of 9..16 rows (CUDA / HIP engines built with a wide window, window_limits.hpp): `max_group` is the
 /// most entries one group can hold = the window's rows (a token routes to an expert once).  Up to 8 it is
 /// `moe_grouped_s2` (one pass of each kernel); 9..16 adds a second pass over the entries from the 9th on.
@@ -120,6 +120,12 @@ inline void moe_grouped_s2_window(const unsigned long long* grp_ptr, const int32
 #if STRATA_VERIFY_MAX_T > 8
     moe_grouped_s2_wide(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out,
                         stream, max_group);
+#elif STRATA_SEQUENCE_VERIFY_MAX_T > 8
+    if (max_group > kWindowMaxT)
+        moe_grouped_s2_wide(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out,
+                            stream, max_group);
+    else
+        moe_grouped_s2(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream);
 #else
     (void) max_group;
     moe_grouped_s2(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream);

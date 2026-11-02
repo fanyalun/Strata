@@ -309,6 +309,25 @@ public:
         always_publish_ = on;
         if (on) device_plan_ = false;
     }
+    /// Transactional windows always ask the host before dispatch and commit even a single input explicitly.
+    void set_transactional(bool on) { transactional_ = on; if (on) set_always_publish(true); }
+    void set_preverify_routes(int top_h, const int32_t* ready_slots) {
+        const bool pre = top_h > 0;
+        if (pre != pre_graph_active_) {
+            for (int s = 0; s < 2; ++s)
+                for (int t = 0; t <= strata::kernels::kSequenceVerifyMaxT; ++t) {
+                    std::swap(exec_[s][t], pre_exec_[s][t]);
+                    std::swap(launched_[s][t], pre_launched_[s][t]);
+                }
+            pre_graph_active_ = pre;
+        }
+        preverify_top_h_ = top_h; route_ready_ = ready_slots;
+        if (!pre) sink_.active_routes = nullptr;
+    }
+    bool bind_transactional_hits(const VerifyHits& hits, std::string& err);
+    bool prepare_transactional(int preverify_rows, std::string& err);
+    using RouteObserver = std::function<void(int64_t, int, const int32_t*, const float*, int, int)>;
+    void set_route_observer(RouteObserver f) { route_observer_ = std::move(f); }
     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
     /// which never ask the host.  The pointer must outlive the verifier's windows.
     bool set_adapt_gate(AdaptGate* g) {
@@ -526,7 +545,15 @@ private:
     /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never
     /// was all-resident.  refresh_ar() looks at the host table before each window.
     bool ar_off_ = false;
-    bool ar_on() const { return all_resident_ && !ar_off_; }
+    bool ar_on() const { return all_resident_ && !ar_off_ && !transactional_; }
+    bool transactional_ = false;
+    int preverify_top_h_ = 0;
+    const int32_t* route_ready_ = nullptr;
+    std::vector<uint8_t> active_routes_;
+    RouteObserver route_observer_;
+    bool pre_graph_active_ = false;
+    cudaGraphExec_t pre_exec_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {};
+    bool pre_launched_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {};
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
@@ -590,7 +617,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[strata::kernels::kWindowMaxT] = {};
+    int32_t last_tokens_[strata::kernels::kSequenceVerifyMaxT] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
@@ -604,9 +631,9 @@ private:
     // [sel_long_][T]: 1 is the long-context QSA select (STRATA_SELECT_LONG=1: multi-CTA top-k, shuffle-free decode
     // scores; see run()); without it only [0] is ever captured
     // (per window size T = 1..kWindowMaxT: a solo window is at most 8 rows, but a merge window of a wide batch is not)
-    cudaGraphExec_t exec_[2][strata::kernels::kWindowMaxT + 1] = {};
-    cudaGraphExec_t exec_nr_[2][strata::kernels::kWindowMaxT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[2][strata::kernels::kWindowMaxT + 1] = {}, launched_nr_[2][strata::kernels::kWindowMaxT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    cudaGraphExec_t exec_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {};
+    cudaGraphExec_t exec_nr_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {}, launched_nr_[2][strata::kernels::kSequenceVerifyMaxT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
@@ -674,7 +701,7 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
-    int groups_[strata::kernels::kWindowMaxT + 1] = {};
+    int groups_[strata::kernels::kSequenceVerifyMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
@@ -690,6 +717,7 @@ private:
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
+    int32_t* block_pos_snap_ = nullptr;
     int32_t* sel_ = nullptr;
     int32_t* topk_scratch_ = nullptr;   // qsa_block_topk_long's multi-CTA exchange (STRATA_SELECT_LONG=1 only)
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;

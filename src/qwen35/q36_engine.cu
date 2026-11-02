@@ -18,6 +18,8 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
+#include "strata/core/three_level.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -29,6 +31,8 @@
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
+#include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #endif
@@ -49,12 +53,14 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -366,7 +372,8 @@ __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, con
     __shared__ int cnt[512], off[512];
     for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
     __syncthreads();
-    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x)
+        if (ids[e] >= 0) atomicAdd(&cnt[ids[e]], 1);
     __syncthreads();
     if (threadIdx.x == 0) {
         int g = 0, pos = 0;
@@ -381,6 +388,7 @@ __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, con
         grp_start[g] = pos;
         *n_groups = g;
         for (int e = 0; e < n_ent; ++e) {
+            if (ids[e] < 0) continue;
             const int p = off[ids[e]]++;
             ent_dst[p] = e;
             ent_tok[p] = e / K_;
@@ -396,7 +404,7 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
     for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
     __syncthreads();
     for (int e = threadIdx.x; e < n_ent; e += blockDim.x)
-        if (slot_of[ids[e]] >= 0) atomicAdd(&cnt[ids[e]], 1);
+        if (ids[e] >= 0 && slot_of[ids[e]] >= 0) atomicAdd(&cnt[ids[e]], 1);
     __syncthreads();
     if (threadIdx.x == 0) {
         int g = 0, pos = 0;
@@ -411,13 +419,23 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
         grp_start[g] = pos;
         *n_groups = g;
         for (int e = 0; e < n_ent; ++e) {
-            if (slot_of[ids[e]] < 0) continue;
+            if (ids[e] < 0 || slot_of[ids[e]] < 0) continue;
+            if (ids[e] < 0) continue;
             const int p = off[ids[e]]++;
             ent_dst[p] = e;
             ent_tok[p] = e / K_;
         }
     }
 }
+__global__ void k_preverify_routes(const int32_t* ids, int32_t* active_ids, uint8_t* active, int n, int k,
+                                    int h, const int32_t* slots) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const bool keep = i % k < h || slots == nullptr || slots[ids[i]] >= 0;
+    active[i] = keep;
+    active_ids[i] = keep ? ids[i] : -1;
+}
+
 /// The CPU pool's expert rows into the entries' rows: parts[e] = cpu[e] where miss[e].  grid (n_ent), block 256.
 __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
     const int e = blockIdx.x;
@@ -1163,6 +1181,29 @@ struct Engine {
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
+    static constexpr int kSequence = K::kSequenceVerifyMaxT;
+    strata::core::ThreeLevelConfig three;
+    int verify_capacity = kVerify;
+    bool window_math = false, three_active = false, three_pre = false, three_mtp_learning = false;
+    int64_t three_base_pos = 0;
+    uint64_t three_window = 0;
+    const std::atomic<bool>* three_cancel = nullptr;
+    std::vector<float*> three_conv, three_S;
+    std::vector<std::vector<double>> three_scores;
+    float* three_hlast = nullptr;
+    void* three_graph_room = nullptr;
+    static constexpr size_t kThreeGraphBudget = (size_t) 128 << 20;
+    size_t three_graph_free_floor = 0;
+    bool three_graph_budget_ready = false;
+    uint64_t three_windows = 0, three_pre_calls = 0, three_full_calls = 0;
+    uint64_t three_native_routes = 0, three_kept_routes = 0;
+    int three_max_full_rows = 0;
+    int32_t *three_tokens = nullptr, *three_picks = nullptr, *active_ids = nullptr;
+    uint8_t *active_routes = nullptr, *h_active_routes = nullptr;
+    int32_t* three_routes = nullptr;
+    std::vector<int32_t> three_inputs, three_committed;
+    bool decode_rows(int T) const { return T <= kGemmT || window_math; }
+
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
@@ -1171,6 +1212,7 @@ struct Engine {
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
     struct GSet {
         cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
+        cudaGraphExec_t three[2][kSequence + 1] = {};
     };
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
@@ -1255,7 +1297,12 @@ struct Engine {
 #if defined(STRATA_Q36_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
+    std::unique_ptr<strata::core::FileExpertSource> file_source;
 #endif
+    bool partitioned = false;
+    bool fatal_expert_state = false;
+    double resident_budget_gib = -1;
+    uint8_t* host_stage[2] = {};
     float *h_h = nullptr, *cpu_out = nullptr, *ecpu = nullptr;
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
@@ -1280,7 +1327,7 @@ struct Engine {
                 for (int e = 0; e < n * Kp; ++e) hy[li].score[(size_t) row_ids[li][(size_t) e]] += 1.0;
     }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
-        if (!m->hybrid) return;
+        if (!m->hybrid || three_active) return;
         count_rows(n);
         if (pos % kRebalanceEvery == 0) {
             CK(cudaStreamSynchronize(st));
@@ -1342,7 +1389,8 @@ struct Engine {
         ctx = ctx_;
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
-        tmax = std::max(tmax_, kVerify);
+        verify_capacity = three.enabled ? kSequence : kVerify;
+        tmax = std::max(tmax_, verify_capacity);
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -1356,7 +1404,7 @@ struct Engine {
         logits_r = dalloc(T * (g.n_expert + 1));
         eparts = dalloc(T * Kp * N); moe_out = dalloc(T * N);
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
-        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
+        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) verify_capacity * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
         CK(cudaMalloc(&xq, K::native_q8_1_bytes((int) N, 1) * T));
@@ -1421,9 +1469,9 @@ struct Engine {
         ent_tok = dalloc_t<int32_t>(T * Kp);
         tok = dalloc_t<int32_t>(T);
         pos0 = dalloc_t<int32_t>(1);
-        pick = dalloc_t<int32_t>(kVerify);
-        amv = dalloc((size_t) kArgBlocks * kVerify);
-        ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
+        pick = dalloc_t<int32_t>(verify_capacity);
+        amv = dalloc((size_t) kArgBlocks * verify_capacity);
+        ami = dalloc_t<int32_t>((size_t) kArgBlocks * verify_capacity);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
@@ -1434,10 +1482,10 @@ struct Engine {
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
-                v_qkv.push_back(dalloc((size_t) kVerify * C));
-                v_hc.push_back(dalloc((size_t) kVerify * C));
-                v_alpha.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
-                v_beta.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
+                v_qkv.push_back(dalloc((size_t) verify_capacity * C));
+                v_hc.push_back(dalloc((size_t) verify_capacity * C));
+                v_alpha.push_back(dalloc((size_t) verify_capacity * g.ssm_v_heads));
+                v_beta.push_back(dalloc((size_t) verify_capacity * g.ssm_v_heads));
             }
         }
         if (m->has_mtp) {
@@ -1503,6 +1551,23 @@ struct Engine {
         d_delta = dalloc_t<int32_t>(1);
         cur = 0;
         load_cur();
+        if (three.enabled) {
+            three_conv.resize(conv.size(), nullptr);
+            three_S.resize(S.size(), nullptr);
+            for (size_t l = 0; l < conv.size(); ++l) {
+                if (conv[l]) three_conv[l] = dalloc(C * (g.ssm_d_conv - 1));
+                if (S[l]) three_S[l] = dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size);
+            }
+            three_hlast = dalloc(N);
+            CK(cudaMalloc(&three_graph_room, kThreeGraphBudget));
+            active_ids = dalloc_t<int32_t>(T * Kp);
+            active_routes = dalloc_t<uint8_t>(T * Kp);
+            CK(cudaHostAlloc((void**) &h_active_routes, T * Kp, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &three_tokens, (size_t) kSequence * 4, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &three_picks, (size_t) kSequence * 4, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &three_routes, m->layers.size() * (size_t) kSequence * Kp * 4,
+                             cudaHostAllocDefault));
+        }
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
@@ -1532,7 +1597,7 @@ struct Engine {
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
-        if (T <= kGemmT) {
+        if (decode_rows(T)) {
             k_gemv_f32<<<dim3(rows8(n_out), T), kThreads, 0, st>>>(W, xin, out, n_in, n_out);
             return;
         }
@@ -1564,11 +1629,11 @@ struct Engine {
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
     void prep(const float* xin, int n, int T, void* q) {
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
+        if (!decode_rows(T)) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
         else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+        if (!decode_rows(T)) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
         else mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
@@ -1747,10 +1812,10 @@ struct Engine {
                    int32_t* o_dst, int32_t* o_tok) {
         const int Kp = (int) m->top_k, n_ent = T * Kp;
         if (slot_of)
-            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, slot_of, L.blobs, L.stride, o_ptr, o_start,
+            k_group_hy<<<1, kThreads, 0, st>>>(three_pre ? active_ids : ids, n_ent, Kp, (int) m->g.n_expert, slot_of, L.blobs, L.stride, o_ptr, o_start,
                                                o_ng, o_dst, o_tok);
         else
-            k_group<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, L.blobs, L.stride, o_ptr, o_start, o_ng, o_dst,
+            k_group<<<1, kThreads, 0, st>>>(three_pre ? active_ids : ids, n_ent, Kp, (int) m->g.n_expert, L.blobs, L.stride, o_ptr, o_start, o_ng, o_dst,
                                             o_tok);
     }
     /// VERIFY: the old grouping of the current `ids` into scratch, compared with grp_ptr / grp_start / n_groups / ent_dst / ent_tok.
@@ -1796,7 +1861,7 @@ struct Engine {
     bool route_group(const Layer& L, const int32_t* slot_of, int T, int ld) {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
-        if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
+        if (three_pre || !fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
         if (slot_of)
             q36k::k_route_group<true><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr,
                                                                  grp_start, n_groups, ent_dst, ent_tok);
@@ -1823,7 +1888,7 @@ struct Engine {
             return;
         }
         const int Kp = (int) m->top_k, n_ent = T * Kp;
-        if (fast_k && n_ent <= 64) {
+        if (!three_pre && fast_k && n_ent <= 64) {
             if (slot_of)
                 q36k::k_group_small<true><<<1, 64, 0, st>>>(ids, n_ent, Kp, slot_of, L.blobs, L.stride, grp_ptr, grp_start,
                                                             n_groups, ent_dst, ent_tok);
@@ -1893,7 +1958,7 @@ struct Engine {
             prep_in(T);
             apply(L.qkv, xq, qkv_b, T);
             apply(L.zg, xq, z, T);
-            if (T <= kGemmT) {
+            if (decode_rows(T)) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
             } else {
@@ -1942,7 +2007,7 @@ struct Engine {
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
                                                               rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                                                               m->rope_base, m->eps, d_delta, mtab_now, rs);
-            if (T > kGemmT) {
+            if (!decode_rows(T)) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
@@ -2004,20 +2069,31 @@ struct Engine {
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
         // router follows; the prompt chunks and the checks keep the separate products
-        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
+        // The unfused Pre router needs compact expert rows, without the appended shared gate.
+        const bool ext = !three_pre && (one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr &&
+            !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8));
         if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
-        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
-        const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
+        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid || window_math);
+        const bool mmq_rows = !hy_rows && !decode_rows(T) && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         const int64_t n_ent = (int64_t) T * Kp;
+        if (three_active && li < m->layers.size()) {
+            CK(cudaMemcpyAsync(three_routes + li * (size_t) kSequence * Kp, ids, (size_t) n_ent * 4,
+                               cudaMemcpyDeviceToHost, st));
+            if (three_pre) {
+                k_preverify_routes<<<grid1(n_ent), kThreads, 0, st>>>(ids, active_ids, active_routes, (int) n_ent,
+                    Kp, three.top_h, hy_rows ? hy[li].slot_of_d : nullptr);
+                CK(cudaMemsetAsync(eparts, 0, (size_t) n_ent * N * 4, st));
+            }
+        }
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
-        } else if (T > kGemmT && use_mmq) {
+        } else if (!decode_rows(T) && use_mmq) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
@@ -2055,8 +2131,8 @@ struct Engine {
                                      std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
         }
         // the shared expert, scaled by sigmoid(w . h)
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
-        if (T <= kGemmT) {
+        if (!decode_rows(T)) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+        if (decode_rows(T)) {
             if (!shared_gu(L, T)) {
                 apply(L.sh_gate, xq, sg, T);
                 apply(L.sh_up, xq, su, T);
@@ -2081,7 +2157,9 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_mmq) {
+        const bool old_math = window_math;
+        window_math = three.enabled && verify;
+        if (main_hybrid && T > hybrid_t && use_mmq && !window_math) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
@@ -2096,6 +2174,7 @@ struct Engine {
                   last ? hmain : h);
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        window_math = old_math;
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -2137,7 +2216,9 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
+        const bool old_math = window_math;
+        window_math = three.enabled && T <= kSequence;
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && !window_math) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -2146,6 +2227,7 @@ struct Engine {
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
         layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
         if (draft) head_draft(hmtp + (size_t) (T - 1) * N);
+        window_math = old_math;
     }
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
@@ -2160,6 +2242,335 @@ struct Engine {
             k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[l], v_hc[l], C, v_alpha[l], v_beta[l], z, L.ssm_norm, m->eps,
                                                    nullptr, HK, HV, n_keep, true);
         }
+    }
+
+    void copy_three_state(bool restore) {
+        const auto& g = m->g;
+        for (size_t l = 0; l < conv.size(); ++l) {
+            if (conv[l]) CK(cudaMemcpyAsync(restore ? conv[l] : three_conv[l], restore ? three_conv[l] : conv[l],
+                (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
+            if (S[l]) CK(cudaMemcpyAsync(restore ? S[l] : three_S[l], restore ? three_S[l] : S[l],
+                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4, cudaMemcpyDeviceToDevice, st));
+        }
+        CK(cudaMemcpyAsync(restore ? hlast : three_hlast, restore ? three_hlast : hlast,
+                           (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
+    }
+    bool begin_window(std::string& err) {
+        if (three_active) { err = "three-level: a private branch is already active"; return false; }
+        CK(cudaStreamSynchronize(st));
+        three_base_pos = pos;
+        three_active = true;
+        three_pre = false;
+        three_committed.clear();
+        three_scores.clear();
+        for (const Hy& h : hy) three_scores.push_back(h.score);
+        copy_three_state(false);
+#if defined(STRATA_Q36_CPU_POOL)
+        if (file_source) file_source->speculative_begin(++three_window);
+#endif
+        return true;
+    }
+    bool cancelled() const { return three_cancel != nullptr && three_cancel->load(); }
+    bool is_eos(int32_t token) const { return token == 248044 || token == 248046; }
+    bool draft(int32_t anchor, int depth, std::vector<int32_t>& out, std::string& err) {
+        if (depth < 0 || depth > three.depth || pos + depth >= ctx) {
+            err = "three-level: MTP draft is outside its configured depth or context";
+            return false;
+        }
+        out.clear();
+        three_pre = false;
+        const int N = (int) m->g.n_embd;
+        int32_t token = anchor;
+        for (int d = 0; d < depth; ++d) {
+            CK(cudaStreamSynchronize(st));
+            three_tokens[0] = token;
+            hpin[1] = (int32_t) (pos + d);
+            CK(cudaMemcpyAsync(tok_m, three_tokens, 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(mtp_seed(), d == 0 ? hlast : hmtp, (size_t) N * 4,
+                               cudaMemcpyDeviceToDevice, st));
+            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, mtp_seed(), true, use_graph); });
+            else forward_mtp(1, pos + d, mtp_seed(), true, false);
+            CK(cudaMemcpyAsync(three_picks, pick_m, 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            token = three_picks[0];
+            out.push_back(token);
+        }
+        return true;
+    }
+    bool verify(strata::core::SpeculativeStage phase, const std::vector<int32_t>& inputs,
+                std::vector<int32_t>& out, std::string& err) {
+        const int T = (int) inputs.size();
+        if (T < 1 || T > verify_capacity || pos + T > ctx) {
+            err = "three-level: native verification window exceeds capacity or context";
+            return false;
+        }
+        CK(cudaStreamSynchronize(st));
+        three_pre = phase == strata::core::SpeculativeStage::PreVerify;
+        // Keep one width per phase; every prior launch is complete at the synchronization above.
+        for (int width = 1; width <= kSequence; ++width) {
+            auto& graph = gs().three[three_pre ? 0 : 1][width];
+            if (width != T && graph) { CK(cudaGraphExecDestroy(graph)); graph = nullptr; }
+        }
+        three_inputs = inputs;
+        std::copy(inputs.begin(), inputs.end(), three_tokens);
+        hpin[1] = (int32_t) pos;
+        CK(cudaMemcpyAsync(tok, three_tokens, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+#if defined(STRATA_Q36_CPU_POOL)
+        if (file_source) file_source->speculative_stage(phase);
+#endif
+        rows_deferred = true;
+        graph_run(gs().three[three_pre ? 0 : 1][T], [&] { forward(T, pos, T, use_graph, true); });
+        rows_deferred = false;
+        CK(cudaMemcpyAsync(three_picks, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        out.assign(three_picks, three_picks + T);
+        if (three_pre) ++three_pre_calls;
+        else { ++three_full_calls; three_max_full_rows = std::max(three_max_full_rows, T); }
+        return true;
+    }
+    bool commit(strata::core::SpeculativeStage phase, int keep, std::string& err) {
+        if (keep < 1 || keep > (int) three_inputs.size()) {
+            err = "three-level: accepted input prefix exceeds the last native window";
+            return false;
+        }
+        const bool pre = phase == strata::core::SpeculativeStage::PreVerify;
+        const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
+        commit(keep);
+#if defined(STRATA_Q36_CPU_POOL)
+        if (pre && file_source)
+            for (size_t l = 0; l < m->layers.size(); ++l)
+                if (lhy(l)) file_source->speculative_hint((int64_t) l, three_routes + l * (size_t) kSequence * Kp,
+                    (int) three_inputs.size(), Kp, keep, hy[l].slot_of.data());
+#endif
+        three_pre = false;
+        CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        if (keep > 1) CK(cudaMemcpyAsync(mtp_seed() + N, hmain, (size_t) (keep - 1) * N * 4,
+                                        cudaMemcpyDeviceToDevice, st));
+        std::copy(three_inputs.begin(), three_inputs.begin() + keep, three_tokens);
+        hpin[1] = (int32_t) pos;
+        CK(cudaMemcpyAsync(tok_m, three_tokens, (size_t) keep * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+        three_mtp_learning = !pre;
+        forward_mtp(keep, pos, mtp_seed(), false, false);
+        three_mtp_learning = false;
+        CK(cudaMemcpyAsync(hlast, hmain + (size_t) (keep - 1) * N, (size_t) N * 4,
+                           cudaMemcpyDeviceToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        pos += keep;
+        if (!pre) {
+            three_committed.assign(three_inputs.begin(), three_inputs.begin() + keep);
+            if (const char* check = std::getenv("STRATA_Q36_WINDOW_CHECK"); check && std::atoi(check) == 3)
+                if (!check_actual_window(keep, err)) return false;
+        }
+        return true;
+    }
+    bool select_confirmed(std::string&) {
+        CK(cudaStreamSynchronize(st));
+        copy_three_state(true);
+        pos = three_base_pos;
+        three_pre = false;
+        return true;
+    }
+    void abort_window() noexcept {
+        if (fatal_expert_state) {
+            (void) cudaStreamSynchronize(st);
+            if (cst) (void) cudaStreamSynchronize(cst);
+            three_active = three_pre = rows_deferred = window_math = three_mtp_learning = false;
+            three_committed.clear();
+#if defined(STRATA_Q36_CPU_POOL)
+            if (file_source) {
+                try { file_source->speculative_end(); }
+                catch (...) { }
+            }
+#endif
+            return;
+        }
+        if (!three_active) return;
+        CK(cudaStreamSynchronize(st));
+        copy_three_state(true);
+        CK(cudaStreamSynchronize(st));
+        pos = three_base_pos;
+        for (size_t l = 0; l < three_scores.size(); ++l) hy[l].score = three_scores[l];
+        three_active = three_pre = rows_deferred = window_math = three_mtp_learning = false;
+        three_committed.clear();
+#if defined(STRATA_Q36_CPU_POOL)
+        if (file_source) file_source->speculative_end();
+#endif
+    }
+    void finish_window() {
+        if (!three_active) return;
+        count_rows((int) three_committed.size());
+        three_active = three_pre = false;
+#if defined(STRATA_Q36_CPU_POOL)
+        if (file_source) file_source->speculative_end();
+#endif
+        try {
+            if (pos % kRebalanceEvery == 0) rebalance(8);
+        } catch (...) {
+            three_active = true;
+            throw;
+        }
+        ++three_windows;
+    }
+    bool three_step(int32_t anchor, int64_t budget, strata::core::ThreeLevelResult& result,
+                    std::string& err, const std::atomic<bool>* cancel = nullptr) {
+        if (const char* check = std::getenv("STRATA_Q36_WINDOW_CHECK"); check && std::atoi(check) == 2)
+            if (!check_three_windows(err)) return false;
+        three_cancel = cancel;
+        const int64_t room = std::min<int64_t>(ctx - pos,
+            main_hybrid ? kRebalanceEvery - pos % kRebalanceEvery : ctx - pos);
+        try {
+            const bool ok = strata::core::run_three_level_window(*this, three, anchor, budget, room, result, err);
+            three_cancel = nullptr;
+            return ok;
+        } catch (const std::exception& e) {
+            abort_window();
+            three_cancel = nullptr;
+            err = e.what();
+            return false;
+        }
+    }
+
+    struct ThreeState {
+        std::vector<std::vector<float>> conv, state, key, value;
+        std::vector<float> last;
+    };
+    ThreeState capture_three_state(int64_t base, int keep) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd;
+        const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+        const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        ThreeState out;
+        out.conv.resize(conv.size()); out.state.resize(S.size());
+        out.key.resize(kc.size()); out.value.resize(vc.size()); out.last.resize((size_t) N);
+        CK(cudaStreamSynchronize(st));
+        for (size_t l = 0; l < conv.size(); ++l) {
+            if (conv[l]) {
+                out.conv[l].resize(cb); out.state[l].resize(sb);
+                CK(cudaMemcpy(out.conv[l].data(), conv[l], cb * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(out.state[l].data(), S[l], sb * 4, cudaMemcpyDeviceToHost));
+            }
+            if (kc[l]) {
+                const size_t valid = (size_t) base + keep;
+                const size_t width = valid * g.head_dim * 4;
+                const size_t pitch = (size_t) ctx * g.head_dim * 4;
+                out.key[l].resize(valid * g.head_dim * g.n_head_kv);
+                out.value[l].resize(out.key[l].size());
+                CK(cudaMemcpy2D(out.key[l].data(), width, kc[l], pitch, width,
+                                (size_t) g.n_head_kv, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy2D(out.value[l].data(), width, vc[l], pitch, width,
+                                (size_t) g.n_head_kv, cudaMemcpyDeviceToHost));
+            }
+        }
+        CK(cudaMemcpy(out.last.data(), hlast, (size_t) N * 4, cudaMemcpyDeviceToHost));
+        return out;
+    }
+    static bool same_three_state(const ThreeState& a, const ThreeState& b) {
+        const auto same = [](const std::vector<float>& x, const std::vector<float>& y) {
+            return x.size() == y.size() && (x.empty() || std::memcmp(x.data(), y.data(), x.size() * 4) == 0);
+        };
+        if (!same(a.last, b.last)) return false;
+        for (size_t l = 0; l < a.conv.size(); ++l)
+            if (!same(a.conv[l], b.conv[l]) || !same(a.state[l], b.state[l]) ||
+                !same(a.key[l], b.key[l]) || !same(a.value[l], b.value[l])) return false;
+        return true;
+    }
+    bool check_actual_window(int keep, std::string& err) {
+        const int T = (int) three_inputs.size(), Kp = (int) m->top_k;
+        const int64_t base = three_base_pos;
+        const ThreeState expected = capture_three_state(base, keep);
+        const auto saved_rows = row_ids;
+        const auto saved_committed = three_committed;
+        std::vector<std::vector<double>> saved_scores;
+        for (const Hy& layer : hy) saved_scores.push_back(layer.score);
+        std::vector<int32_t> expected_picks(three_picks, three_picks + keep);
+        std::vector<int32_t> saved_routes(three_routes, three_routes + m->layers.size() * (size_t) kSequence * Kp);
+        std::vector<float> saved_logits((size_t) m->g.n_vocab);
+        CK(cudaMemcpy(saved_logits.data(), logits, saved_logits.size() * 4, cudaMemcpyDeviceToHost));
+        const int32_t saved_pick = greedy();
+        if (!select_confirmed(err)) return false;
+        std::vector<int32_t> replayed;
+        for (int t = 0; t < keep; ++t) {
+            const int32_t input = three_inputs[(size_t) t];
+            process(&input, 1, [](int64_t) {});
+            replayed.push_back(greedy());
+        }
+        const ThreeState replay = capture_three_state(base, keep);
+        row_ids = saved_rows;
+        three_committed = saved_committed;
+        std::copy(saved_routes.begin(), saved_routes.end(), three_routes);
+        for (size_t l = 0; l < saved_scores.size(); ++l) hy[l].score = saved_scores[l];
+        CK(cudaMemcpy(logits, saved_logits.data(), saved_logits.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(pick, &saved_pick, 4, cudaMemcpyHostToDevice));
+        if (replayed != expected_picks || !same_three_state(expected, replay)) {
+            err = "actual Full accepted-prefix replay differs at position " + std::to_string(base);
+            return false;
+        }
+        std::fprintf(stderr, "strata-q36: actual Full replay: position %lld width %d keep %d, "
+                             "picks/GDN/conv/seed/target+MTP KV exact; residency frozen before learning\n",
+                     (long long) base, T, keep);
+        return true;
+    }
+
+    bool check_three_windows(std::string& err) {
+        const auto& g = m->g;
+        std::vector<float> saved_logits((size_t) g.n_vocab);
+        CK(cudaMemcpy(saved_logits.data(), logits, saved_logits.size() * 4, cudaMemcpyDeviceToHost));
+        const int32_t saved_pick = greedy();
+        const int widths[] = {1, 4, 8, 9, 16, 17, 24, 25};
+        std::vector<std::pair<int, int>> shapes;
+        for (int T : widths) {
+            std::vector<int> keeps{1, std::max(1, T / 2), T};
+            keeps.erase(std::unique(keeps.begin(), keeps.end()), keeps.end());
+            for (int keep : keeps) shapes.emplace_back(T, keep);
+        }
+        for (const auto& shape : shapes) {
+            const int T = shape.first, keep = shape.second;
+            if (pos + T > ctx) { err = "window check needs 25 cells after the prompt"; return false; }
+            if (!begin_window(err)) return false;
+            const int64_t base = pos;
+            std::vector<int32_t> inputs((size_t) T), expected;
+            for (int t = 0; t < T; ++t) inputs[(size_t) t] = 198 + 7 * t;
+            ThreeState reference;
+            for (int t = 0; t < T; ++t) {
+                const int32_t token = inputs[(size_t) t];
+                process(&token, 1, [](int64_t) {});
+                expected.push_back(greedy());
+                if (t + 1 == keep) reference = capture_three_state(base, keep);
+            }
+            if (!select_confirmed(err)) return false;
+            if (!m->hybrid) {
+                std::vector<int32_t> pre_picks;
+                if (!verify(strata::core::SpeculativeStage::PreVerify, inputs, pre_picks, err) ||
+                    !commit(strata::core::SpeculativeStage::PreVerify, keep, err)) { abort_window(); return false; }
+                const bool pre_exact = pre_picks == expected &&
+                    same_three_state(reference, capture_three_state(base, keep));
+                if (!pre_exact) {
+                    abort_window();
+                    err = "all-hit Pre-Verify differs from native Target at width " + std::to_string(T) +
+                          " keep " + std::to_string(keep);
+                    return false;
+                }
+                std::fprintf(stderr, "strata-q36: native all-hit Pre check: %d rows keep %d, "
+                                     "picks/GDN/conv/seed/full-valid target+MTP KV exact\n", T, keep);
+                if (!select_confirmed(err)) return false;
+            }
+            std::vector<int32_t> actual;
+            if (!verify(strata::core::SpeculativeStage::FullVerify, inputs, actual, err) ||
+                !commit(strata::core::SpeculativeStage::FullVerify, keep, err)) { abort_window(); return false; }
+            const bool exact = actual == expected && same_three_state(reference, capture_three_state(base, keep));
+            abort_window();
+            if (!exact) {
+                err = "native window parity failed at width " + std::to_string(T) + " keep " + std::to_string(keep);
+                return false;
+            }
+            std::fprintf(stderr, "strata-q36: native window check: %d rows keep %d, picks/GDN/conv/seed/target+MTP KV exact\n", T, keep);
+        }
+        CK(cudaMemcpy(logits, saved_logits.data(), saved_logits.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(pick, &saved_pick, 4, cudaMemcpyHostToDevice));
+        return true;
     }
 
     // ---- the hybrid mode
@@ -2181,6 +2592,26 @@ struct Engine {
         static const bool all = std::getenv("STRATA_Q36_STREAM_ALL") != nullptr;
         const int ne = (int) m->g.n_expert;
         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+#if defined(STRATA_Q36_CPU_POOL)
+        if (file_source) {
+            CK(cudaEventSynchronize(ev_copy[b]));
+            const int li = stream_seq[(size_t) i];
+            for (int e = 0; e < ne; ++e) {
+                uint8_t* dst = stage[b] + (size_t) e * L.stride;
+                const int slot = H.slot_of[(size_t) e];
+                if (slot >= 0) {
+                    CK(cudaMemcpyAsync(dst, L.blobs + (size_t) slot * L.stride, L.L.bytes,
+                                       cudaMemcpyDeviceToDevice, cst));
+                } else {
+                    uint8_t* src = host_stage[b] + (size_t) e * L.stride;
+                    if (!file_source->copy_blob(li, e, src)) throw std::runtime_error("expert file read failed");
+                    CK(cudaMemcpyAsync(dst, src, L.L.bytes, cudaMemcpyHostToDevice, cst));
+                }
+            }
+            CK(cudaEventRecord(ev_copy[b], cst));
+            return;
+        }
+#endif
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
         if (all || 2 * L.n_slots < ne) {
@@ -2227,6 +2658,7 @@ struct Engine {
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+        if (three_pre) CK(cudaMemcpyAsync(h_active_routes, active_routes, (size_t) n_ent, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecord(ev_route, st));
         group_entries(L, hy[li].slot_of_d, T);
@@ -2257,10 +2689,16 @@ struct Engine {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
             row_ids[li].assign(h_ids, h_ids + n_ent);
         }
+        if (file_source) {
+            std::vector<int32_t> misses;
+            for (int e = 0; e < n_ent; ++e)
+                if ((!three_pre || h_active_routes[e]) && H.slot_of[(size_t) h_ids[e]] < 0) misses.push_back(h_ids[e]);
+            file_source->begin_layer((int64_t) li, misses.data(), (int64_t) misses.size());
+        }
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
-            if (!defer) H.score[(size_t) x] += 1.0;
-            h_miss[e] = H.slot_of[(size_t) x] < 0;
+            if (!defer && (!three_active || three_mtp_learning)) H.score[(size_t) x] += 1.0;
+            h_miss[e] = (!three_pre || h_active_routes[e]) && H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
             const int t = e / Kp;
@@ -2271,7 +2709,8 @@ struct Engine {
             auto it = open.find(x);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
-                j.blob = L.hblobs + (size_t) x * L.stride;
+                j.blob = file_source ? file_source->blob((int64_t) li, x) : L.hblobs + (size_t) x * L.stride;
+                if (j.blob == nullptr) throw std::runtime_error("expert file read failed");
                 jobs.push_back(j);
                 it = open.insert_or_assign(x, jobs.size() - 1).first;
             }
@@ -2280,8 +2719,15 @@ struct Engine {
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }
+        int retained = n_ent;
+        if (three_pre) {
+            retained = 0;
+            for (int e = 0; e < n_ent; ++e) retained += h_active_routes[e] != 0;
+            three_native_routes += n_ent;
+            three_kept_routes += retained;
+        }
         hy_cpu += n_miss;
-        hy_gpu += n_ent - n_miss;
+        hy_gpu += retained - n_miss;
         if (n_miss == 0) return;
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
@@ -2298,7 +2744,13 @@ struct Engine {
     /// over all layers, between forwards (the copies are on the engine's stream).
     void rebalance(int max_swaps) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
-        if (!m->hybrid || off || warming) return;
+        if (!m->hybrid || off || warming || three_active) return;
+        const auto checked_copy = [&](cudaError_t status) {
+            if (status != cudaSuccess) {
+                fatal_expert_state = true;
+                throw std::runtime_error(std::string("expert exchange CUDA failure: ") + cudaGetErrorString(status));
+            }
+        };
         const int64_t ne = m->g.n_expert;
         int left = max_swaps;
         for (size_t li = 0; li < hy.size() && left > 0; ++li) {
@@ -2326,11 +2778,42 @@ struct Engine {
                     if (H.score[(size_t) y] >= H.score[(size_t) x]) { vi = victims.size(); break; }
                     // y must not be in the top S itself
                     ++vi;
+#if defined(STRATA_Q36_CPU_POOL)
+                    if (file_source) {
+                        const uint8_t* src = file_source->blob((int64_t) li, x);
+                        if (src == nullptr) throw std::runtime_error("expert promotion read failed");
+                        const bool exchange = file_source->has_resident((int64_t) li, x);
+                        // Rollback cannot repair a slot after its bytes change but before its mapping is published.
+                        fatal_expert_state = true;
+                        if (exchange) {
+                            checked_copy(cudaMemcpyAsync(file_source->exchange_buffer(0, (int64_t) li),
+                                               L.blobs + (size_t) s * L.stride, L.L.bytes,
+                                               cudaMemcpyDeviceToHost, st));
+                        }
+                        checked_copy(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, src, L.L.bytes,
+                                           cudaMemcpyHostToDevice, st));
+                        checked_copy(cudaStreamSynchronize(st));
+                        if (exchange && three.enabled && max_swaps == 8)
+                            if (const char* check = std::getenv("STRATA_Q36_WINDOW_CHECK"); check && std::atoi(check) == 4)
+                                throw std::runtime_error("injected expert exchange failure after GPU upload");
+                        if (exchange && (!file_source->stage_exchange((int64_t) li, x, y, 0) ||
+                                         file_source->commit_exchanges() != 1))
+                            throw std::runtime_error("expert partition exchange failed");
+                    } else
+#endif
+                    {
+                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride,
+                                           L.L.bytes, cudaMemcpyHostToDevice, st));
+                    }
                     H.slot_of[(size_t) y] = -1;
                     H.slot_of[(size_t) x] = s;
                     H.exp_in_slot[(size_t) s] = x;
-                    CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
-                                       cudaMemcpyHostToDevice, st));
+                    if (three.enabled || partitioned) {
+                        checked_copy(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4,
+                                           cudaMemcpyHostToDevice, st));
+                        checked_copy(cudaStreamSynchronize(st));
+                        fatal_expert_state = false;
+                    }
                     --left;
                     ++hy_swaps;
                     changed = true;
@@ -2338,11 +2821,15 @@ struct Engine {
                 }
                 if (vi >= victims.size()) break;
             }
-            if (changed)
-                CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+            if (changed) {
+                const auto copied = cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st);
+                if (three.enabled || partitioned) checked_copy(copied);
+                else CK(copied);
+            }
             for (double& v : H.score) v *= 0.5;
         }
-        CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
+        if (three.enabled || partitioned) checked_copy(cudaStreamSynchronize(st));
+        else CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
     }
 
     void shrink_att(size_t floats) {
@@ -2360,6 +2847,9 @@ struct Engine {
                 if (*g) { CK(cudaGraphExecDestroy(*g)); *g = nullptr; }
             for (auto& g : gset.gv)
                 if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+            for (auto& phase : gset.three)
+                for (auto& g : phase)
+                    if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
         }
         for (auto& kv : row_graphs)
             if (kv.second) CK(cudaGraphExecDestroy(kv.second));
@@ -2373,10 +2863,34 @@ struct Engine {
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
             body();
             CK(cudaStreamEndCapture(st, &graph));
-            CK(cudaGraphInstantiate(&gx, graph, 0));
+            const cudaError_t instantiated = cudaGraphInstantiate(&gx, graph, 0);
             CK(cudaGraphDestroy(graph));
+            if (three.enabled && instantiated == cudaErrorMemoryAllocation) {
+                gx = nullptr;
+                (void) cudaGetLastError();
+                limit_three_graphs("graph instantiation ran out of memory");
+                body();
+                return;
+            }
+            CK(instantiated);
+            if (three.enabled && three_graph_budget_ready) {
+                size_t free = 0, total = 0;
+                CK(cudaMemGetInfo(&free, &total));
+                if (free < three_graph_free_floor) {
+                    limit_three_graphs("graph cache exceeded its reserved memory");
+                    body();
+                    return;
+                }
+            }
         }
         CK(cudaGraphLaunch(gx, st));
+    }
+    void limit_three_graphs(const char* reason) {
+        CK(cudaStreamSynchronize(st));
+        reset_graphs();
+        use_graph = mtp_graph = false;
+        std::fprintf(stderr, "strata-q36: three-level graph budget %zu MiB: %s; native eager execution, "
+                             "verification capacity stays %d rows\n", kThreeGraphBudget >> 20, reason, verify_capacity);
     }
 
     // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
@@ -2447,6 +2961,8 @@ struct Engine {
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, hpin, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            if (three.enabled)
+                CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             chunk_pictures(pos, 1);
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
@@ -2455,6 +2971,11 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
+            if (three.enabled) {
+                CK(cudaMemcpyAsync(tok_m, tok, 4, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(pos0_m, pos0, 4, cudaMemcpyDeviceToDevice, st));
+                forward_mtp(1, pos, mtp_seed(), false, false);
+            }
             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += 1;
             after_rows(1);
@@ -2766,7 +3287,12 @@ struct Engine {
         reset();
         if (tmax > kGemmT + 1 && ctx > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
-        if (mtp_d > 0) {
+        if (three.enabled) {
+            strata::core::ThreeLevelResult result;
+            std::string err;
+            if (!three_step(filler, three.max_candidates() + 1, result, err))
+                throw std::runtime_error(err);
+        } else if (mtp_d > 0) {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
             spec_step(filler, fix, mtp_d, drafts, picks);
@@ -2776,6 +3302,9 @@ struct Engine {
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_cpu_ms = 0;
+        three_windows = three_pre_calls = three_full_calls = 0;
+        three_native_routes = three_kept_routes = 0;
+        three_max_full_rows = 0;
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
@@ -2926,8 +3455,42 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
+    bool pinned = false;
+    if (E.partitioned) {
+        C::ExpertLayout layout;
+        layout.native = true;
+        layout.n_layers = (int64_t) all.size();
+        layout.n_expert = ne;
+        layout.max_blob = 0;
+        for (size_t li = 0; li < all.size(); ++li) {
+            const Layer& L = *all[li];
+            C::NativeFmt fmt;
+            if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, fmt, err)) return false;
+            if (fmt.bytes != L.L.bytes || fmt.up_off != L.L.up_off || fmt.down_off != L.L.down_off) {
+                err = "the CPU and GPU expert layouts differ";
+                return false;
+            }
+            layout.fmt.push_back(fmt);
+            layout.bytes.push_back(fmt.bytes);
+            layout.offset.push_back(layout.total);
+            layout.total += (uint64_t) fmt.bytes * ne;
+            layout.max_blob = std::max<uint64_t>(layout.max_blob, fmt.bytes);
+            for (const char* role : {"gate", "up", "down"}) {
+                size_t shard = 0;
+                const auto* t = m.file->find("blk." + std::to_string(li) + ".ffn_" + role + "_exps.weight", &shard);
+                if (t == nullptr) { err = "an expert tensor is missing"; return false; }
+                const auto& f = m.file->shard(shard);
+                layout.gguf_off.push_back(f.data_start() + t->offset);
+                layout.gguf_file.push_back(std::filesystem::path(f.path()).filename().string());
+            }
+        }
+        E.file_source = std::make_unique<strata::core::FileExpertSource>();
+        if (!E.file_source->open_gguf(m.file->meta().path(), layout, err)) return false;
+        host = 0;
+    } else {
+        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+    }
+    if (!E.partitioned && !pinned) {
         (void) cudaGetLastError();
         arena = (uint8_t*) std::malloc(host);
         if (!arena) {
@@ -2950,15 +3513,26 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        if (!E.partitioned) {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        }
         L.n_slots = S;
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+            if (E.file_source) {
+                std::vector<uint8_t> blob(L.L.bytes);
+                for (int e = 0; e < S; ++e) {
+                    if (!E.file_source->copy_blob((int64_t) li, e, blob.data())) {
+                        err = "an expert cache fill could not read its file";
+                        return false;
+                    }
+                    CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
+            } else CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
@@ -2994,15 +3568,34 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
+            if (E.file_source) {
+                CK(cudaHostAlloc((void**) &E.host_stage[b], max_layer + kMmqTail, cudaHostAllocDefault));
+                CK(cudaEventRecord(E.ev_copy[b], E.cst));
+            }
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
+    if (E.file_source) {
+        std::vector<std::pair<int32_t, int32_t>> gpu_pairs, rank;
+        for (size_t li = 0; li < all.size(); ++li)
+            for (int e = 0; e < ne; ++e) {
+                if (e < all[li]->n_slots) gpu_pairs.emplace_back((int32_t) li, e);
+                else rank.emplace_back((int32_t) li, e);
+            }
+        const uint64_t budget_ram = E.resident_budget_gib < 0 ? strata::core::FileExpertSource::kResidentWhatFits
+                                                             : (uint64_t) (E.resident_budget_gib * (1ull << 30));
+        if (budget_ram != 0 && !E.file_source->pin_partition(gpu_pairs, err, budget_ram, rank)) return false;
+        if (!E.file_source->reserve_exchanges(1, err)) return false;
+        std::fprintf(stderr, "strata-q36: partitioned experts: %zu GPU experts, %.2f GiB CPU resident, remaining "
+                             "experts from GGUF; no retained prompt-loan copies\n", gpu_pairs.size(),
+                     (double) E.file_source->resident_bytes() / (1ull << 30));
+    }
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
                      "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
                      (long long) ne);
-    else
+    else if (!E.partitioned)
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
@@ -3168,11 +3761,19 @@ struct Slot {
 /// control lines.
 struct Serve {
     Engine& E;
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::string> lines;
-    bool eof = false;
-    std::atomic<bool> stop{false};
+    struct Input {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool eof = false;
+        std::atomic<bool> stop{false}, closed{false};
+    };
+    std::shared_ptr<Input> input = std::make_shared<Input>();
+    std::mutex& mu = input->mu;
+    std::condition_variable& cv = input->cv;
+    std::deque<std::string>& lines = input->lines;
+    bool& eof = input->eof;
+    std::atomic<bool>& stop = input->stop;
     std::vector<Slot> slots;
     int n_active = 0;
     std::vector<float> lg;
@@ -3183,6 +3784,7 @@ struct Serve {
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
+    ~Serve() { input->closed.store(true); }
 
     /// BSTOP / BYIELD lines among the queued ones: applied now (a window is a moment away at most).
     void poll_control() {
@@ -3421,6 +4023,9 @@ struct Serve {
     void request(const std::string& line) {
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
+        if (E.three.enabled && (adm || geni)) {
+            std::printf("ERR three-level supports one text request at a time\n"); std::fflush(stdout); return;
+        }
         if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
             std::fflush(stdout);
@@ -3471,7 +4076,13 @@ struct Serve {
                     q = *qe == ',' ? qe + 1 : qe;
                     if (*qe != ',' && *qe != '\0') { img_keys.clear(); break; }
                 }
+            } else if (E.three.enabled) {
+                std::printf("ERR three-level does not support request option %s\n", key.c_str());
+                std::fflush(stdout); return;
             }
+        }
+        if (E.three.enabled && (!std::isfinite(smp.temperature) || smp.temperature != 0.f || smp.needs_logits())) {
+            std::printf("ERR three-level requires greedy sampling without penalties\n"); std::fflush(stdout); return;
         }
         std::string emb;
         if (geni) {
@@ -3612,7 +4223,29 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
-        for (;;) {
+        if (E.three.enabled) {
+            auto emit = [&](int32_t token) {
+                std::printf("T %d\n", token); std::fflush(stdout);
+                ++produced; hist.push_back(token);
+            };
+            emit(nx);
+            if (is_eos(nx)) finish = "stop";
+            else while (produced < max_new && E.pos < E.ctx && !stop.load()) {
+                strata::core::ThreeLevelResult result;
+                std::string err;
+                if (!E.three_step(nx, max_new - produced, result, err, &stop)) {
+                    std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return;
+                }
+                if (result.cancelled) { finish = "cancel"; break; }
+                if (result.outputs.empty()) break;
+                ss.live.insert(ss.live.end(), E.three_committed.begin(), E.three_committed.end());
+                offered += result.candidates.size(); accepted += result.accepted_candidates;
+                for (int32_t token : result.outputs) emit(token);
+                nx = result.next_anchor;
+                if (result.stopped_eos) { finish = "stop"; break; }
+            }
+            if (stop.load() && std::string(finish) != "stop") finish = "cancel";
+        } else for (;;) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
@@ -3666,21 +4299,25 @@ struct Serve {
     }
 
     int run() {
+        // A detached getline must not hold stdin's FILE lock while a fatal request exits without client EOF.
+        std::ios::sync_with_stdio(false);
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
-        std::thread reader([&] {
+        // A fatal request may return while getline is blocked; the reader owns only its control state.
+        std::thread reader([input = input] {
             std::string l;
             while (std::getline(std::cin, l)) {
+                if (input->closed.load()) break;
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop.store(true); continue; }
-                std::lock_guard<std::mutex> lk(mu);
-                lines.push_back(l);
-                cv.notify_one();
+                if (l == "STOP") { input->stop.store(true); continue; }
+                std::lock_guard<std::mutex> lk(input->mu);
+                input->lines.push_back(l);
+                input->cv.notify_one();
             }
-            std::lock_guard<std::mutex> lk(mu);
-            eof = true;
-            cv.notify_one();
+            std::lock_guard<std::mutex> lk(input->mu);
+            input->eof = true;
+            input->cv.notify_one();
         });
         reader.detach();
         for (;;) {
@@ -3697,20 +4334,33 @@ struct Serve {
                     return 0;
                 }
             }
-            if (!have) { window(); continue; }
-            if (line.empty()) continue;
-            if (line.rfind("BSTOP ", 0) == 0) {
-                const int b = std::atoi(line.c_str() + 6);
-                if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
-            } else if (line.rfind("BYIELD", 0) == 0) {
-                // (a read that has ended)
-            } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
-                request(line);
-            } else {
-                std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+            if (have && line.empty()) continue;
+            try {
+                if (!have) window();
+                else {
+                    if (line.rfind("BSTOP ", 0) == 0) {
+                        const int b = std::atoi(line.c_str() + 6);
+                        if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
+                    } else if (line.rfind("BYIELD", 0) == 0) {
+                        // (a read that has ended)
+                    } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
+                        request(line);
+                    } else {
+                        std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+                        std::fflush(stdout);
+                    }
+                    if (n_active > 0) window();
+                }
+            } catch (const std::exception& err) {
+                if (!E.fatal_expert_state) throw;
+                std::printf("ERR %s\n", err.what());
                 std::fflush(stdout);
             }
-            if (n_active > 0) window();
+            if (E.fatal_expert_state) {
+                E.abort_window();
+                std::fprintf(stderr, "strata-q36: expert state is invalid; stopping before the next request\n");
+                return 1;
+            }
         }
     }
 };
@@ -3726,6 +4376,10 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
+    double resident_budget_gib = -1.0;
+    bool partitioned = false;
+    strata::core::ThreeLevelConfig three;
+    bool mtp_off = false, multi_gpu = false, batch_given = false;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
@@ -3740,7 +4394,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--max-new") n_gen = std::atoi(next().c_str());
         else if (a == "--no-token-graph") graph = false;
         else if (a == "--pool-workers") cpu_threads = std::atoi(next().c_str());
-        else if (a == "--gpu") (void) next();   // applied by strata before the switch (CUDA/HIP_VISIBLE_DEVICES)
+        else if (a == "--gpu") { const std::string v = next(); multi_gpu |= v.find(',') != std::string::npos; }   // applied by strata before the switch (CUDA/HIP_VISIBLE_DEVICES)
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
@@ -3754,18 +4408,51 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
+        else if (a == "--three-level") three.enabled = true;
+        else if (a == "--three-level-depth" || a == "--three-level-loops" || a == "--preverify-top-h") {
+            int value = 0;
+            if (!strata::core::three_level_parse_int(next(), value)) {
+                std::fprintf(stderr, "strata-q36: %s requires an integer\n", a.c_str()); return 2;
+            }
+            if (a == "--three-level-depth") three.depth = value;
+            else if (a == "--three-level-loops") three.loops = value;
+            else three.top_h = value;
+        }
+        else if (a == "--no-mtp") { mtp_off = true; mtp_d = 0; }
+        else if (a == "--layer-split" || a == "--gpus" || a == "--peer-device" || a == "--batch-groups") {
+            multi_gpu = true; (void) next();
+        }
         else if (a == "--mtp") {
             // a number of drafts; Flash-Next's "--mtp <draft layer dir>" means nothing for this family
             const std::string v = next();
-            if (!v.empty() && std::isdigit((unsigned char) v[0])) mtp_d = std::atoi(v.c_str());
+            if (v == "off" || v == "false" || v == "0") { mtp_off = true; mtp_d = 0; }
+            else if (!v.empty() && std::isdigit((unsigned char) v[0])) { mtp_d = std::atoi(v.c_str()); mtp_off = false; }
             else std::fprintf(stderr, "strata-q36: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
                                       "drafts)\n", v.c_str());
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
-        else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
+        else if (a == "--batch" || a == "--slots") { batch = std::atoi(next().c_str()); batch_given = true; }
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--expert-placement") {
+            const std::string v = next();
+            if (v != "native" && v != "partitioned") {
+                std::fprintf(stderr, "strata-q36: --expert-placement takes native or partitioned\n");
+                return 2;
+            }
+            partitioned = v == "partitioned";
+        }
+        else if (a == "--resident-budget-gib") {
+            const std::string v = next();
+            char* end = nullptr;
+            resident_budget_gib = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() || *end != '\0' || !std::isfinite(resident_budget_gib) ||
+                resident_budget_gib < 0 || resident_budget_gib >= (double) (1ull << 34)) {
+                std::fprintf(stderr, "strata-q36: --resident-budget-gib requires a finite nonnegative GiB value\n");
+                return 2;
+            }
+        }
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -3779,12 +4466,34 @@ int strata::qwen35::run(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
+                         "       [--expert-placement native|partitioned] [--resident-budget-gib N]\n"
+                         "       [--three-level --three-level-depth 3 --three-level-loops 6 --preverify-top-h 4]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
         }
     }
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
+    if (three.enabled) {
+        std::string why;
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+        why = "three-level requires the CUDA engine";
+#else
+        if (!three.validate(why, 8)) {}
+        else if (K::kSequenceVerifyMaxT < strata::core::kThreeLevelMaxRows) why = "three-level requires 25-row native verification";
+        else if (mtp_off) why = "--three-level conflicts with explicitly disabled MTP";
+        else if (batch_given || batch_mtp || multi_gpu) why = "three-level requires one GPU and one request";
+        else if (vision || !emb_file.empty()) why = "three-level supports text requests only";
+        else if (!force.empty() || !dump_full.empty()) why = "three-level does not support forced tokens or logit dumps";
+#endif
+        if (!why.empty()) { std::fprintf(stderr, "strata-q36: %s\n", why.c_str()); return 2; }
+        mtp_d = three.depth;
+    }
+
+    if (resident_budget_gib >= 0 && !partitioned) {
+        std::fprintf(stderr, "strata-q36: --resident-budget-gib requires --expert-placement partitioned\n");
+        return 2;
+    }
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
     setenv("STRATA_Q8_PACKED", "1", 0);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
@@ -3794,7 +4503,7 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
-    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (!three.enabled && (mtp_d < 0 || mtp_d > 7)) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     Model m;
     std::string err;
@@ -3804,8 +4513,14 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
     }
+    if (three.enabled && !m.has_mtp) {
+        std::fprintf(stderr, "strata-q36: three-level needs the GGUF's native MTP block\n"); return 2;
+    }
     Engine E;
+    E.three = three;
     E.use_graph = graph;
+    E.partitioned = partitioned;
+    E.resident_budget_gib = resident_budget_gib;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -3855,6 +4570,33 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    if (E.three_graph_room) {
+        // Enforce this room across the live graph cache instead of assuming each width fits it.
+        CK(cudaFree(E.three_graph_room));
+        E.three_graph_room = nullptr;
+        size_t free = 0, total = 0;
+        CK(cudaMemGetInfo(&free, &total));
+        E.three_graph_free_floor = free > E.kThreeGraphBudget ? free - E.kThreeGraphBudget : 0;
+        E.three_graph_budget_ready = true;
+    }
+#if defined(STRATA_Q36_CPU_POOL)
+    if (E.file_source) {
+        const char* pf = std::getenv("STRATA_IO_PREFETCH");
+        const bool native_default = (pf == nullptr || pf[0] == '\0') && E.file_source->linux_io_defaults();
+        const char* th = std::getenv("STRATA_IO_PF_THREADS");
+        const int threads = th != nullptr ? std::atoi(th) : 0;
+        if (native_default || (pf != nullptr && std::atoi(pf) != 0))
+            E.file_source->set_io_prefetch(true, threads);
+        else if (const char* stats = std::getenv("STRATA_IO_STATS"); stats && std::atoi(stats) != 0)
+            E.file_source->set_io_stats(true);
+        std::fprintf(stderr, "strata-q36: expert io config: prefetch=%d stats=%d threads=%d linux_default=%d\n",
+                     (int) E.file_source->io_prefetch(), (int) E.file_source->io_stats(),
+                     E.file_source->io_prefetch() ? (threads > 0 ? threads : 8) : 0, (int) native_default);
+    }
+#endif
+    if (three.enabled)
+        std::fprintf(stderr, "strata-q36: three-level depth %d loops %d top-h %d, at most %d candidates, native capacity %d\n",
+                     three.depth, three.loops, three.top_h, three.max_candidates(), E.verify_capacity);
     struct Report {
         Engine& E;
         ~Report() {
@@ -3862,11 +4604,43 @@ int strata::qwen35::run(int argc, char** argv) {
             if (E.verify_k)
                 for (const auto& kv : E.v_by)
                     std::fprintf(stderr, "strata-q36 VERIFY   %s: %lld mismatches\n", kv.first.c_str(), kv.second);
+            if (E.three.enabled)
+                std::fprintf(stderr, "strata-q36: three-level: %llu windows, %llu Pre-Verify calls, %llu Full Verify calls, "
+                    "largest full window %d rows; hybrid Pre-Verify routes %llu kept of %llu native\n",
+                    (unsigned long long) E.three_windows, (unsigned long long) E.three_pre_calls,
+                    (unsigned long long) E.three_full_calls, E.three_max_full_rows,
+                    (unsigned long long) E.three_kept_routes, (unsigned long long) E.three_native_routes);
             if (!E.m->hybrid) return;
             const long long n = E.hy_cpu + E.hy_gpu;
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+#if defined(STRATA_Q36_CPU_POOL)
+            if (E.file_source) {
+                std::fprintf(stderr, "strata-q36: expert tiers (cumulative): %lld RAM reads, %llu bytes read from files, "
+                                     "%lld CPU/GPU exchanges, %.2f GiB CPU resident\n",
+                             (long long) E.file_source->ram_reads(),
+                             (unsigned long long) E.file_source->file_read_bytes(),
+                             (long long) E.file_source->exchanges(),
+                             (double) E.file_source->resident_bytes() / (1ull << 30));
+                const auto io = E.file_source->io_counters();
+                std::fprintf(stderr, "strata-q36: expert io (cumulative): prefetch=%d stats=%d "
+                                     "cached_bytes=%llu uncached_bytes=%llu pread_bytes=%llu pread_us=%llu pread_n=%llu "
+                                     "pf_jobs=%llu pf_read_blobs=%llu pf_used=%llu pf_unused=%llu pf_bytes=%llu "
+                                     "pf_used_bytes=%llu critical_wait_us=%llu critical_wait_n=%llu pf_dropped=%llu "
+                                     "pf_late=%llu pf_rej_conf=%llu pf_rej_budget=%llu pf_budget_bytes=%llu\n",
+                             (int) E.file_source->io_prefetch(), (int) E.file_source->io_stats(),
+                             (unsigned long long) io.cached_bytes, (unsigned long long) io.uncached_bytes,
+                             (unsigned long long) io.pread_bytes, (unsigned long long) io.pread_us,
+                             (unsigned long long) io.pread_n, (unsigned long long) io.pf_jobs,
+                             (unsigned long long) io.pf_read_blobs, (unsigned long long) io.pf_used,
+                             (unsigned long long) io.pf_unused, (unsigned long long) io.pf_bytes,
+                             (unsigned long long) io.pf_used_bytes, (unsigned long long) io.crit_us,
+                             (unsigned long long) io.crit_n, (unsigned long long) io.pf_dropped,
+                             (unsigned long long) io.pf_late, (unsigned long long) io.pf_rej_conf,
+                             (unsigned long long) io.pf_rej_budget, (unsigned long long) io.pf_budget_bytes);
+            }
+#endif
         }
     } report{E};
     E.reset();
@@ -3921,7 +4695,29 @@ int strata::qwen35::run(int argc, char** argv) {
     const auto t0 = Clock::now();
     E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {});
     const double pp_ms = ms_since(t0);
+    const char* window_check = std::getenv("STRATA_Q36_WINDOW_CHECK");
+    if (E.three.enabled && window_check && std::atoi(window_check) == 1 && !E.check_three_windows(err)) {
+        std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1;
+    }
     const auto t1 = Clock::now();
+    if (E.three.enabled) {
+        int nx = E.greedy();
+        if (n_gen > 0) gen.push_back(nx);
+        while ((int) gen.size() < n_gen && !E.is_eos(nx) && E.pos < E.ctx) {
+            strata::core::ThreeLevelResult result;
+            if (!E.three_step(nx, n_gen - (int64_t) gen.size(), result, err)) {
+                std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1;
+            }
+            if (result.outputs.empty()) break;
+            gen.insert(gen.end(), result.outputs.begin(), result.outputs.end());
+            nx = result.next_anchor;
+            if (result.stopped_eos) break;
+        }
+        std::printf("gen:"); for (int32_t token : gen) std::printf(" %d", token); std::printf("\n");
+        std::fprintf(stderr, "strata-q36: prompt %zu tokens in %.1f ms, %zu generated in %.1f ms (%.1f tok/s), three-level\n",
+                     prompt.size(), pp_ms, gen.size(), ms_since(t1), gen.size() / (ms_since(t1) / 1000.0));
+        return 0;
+    }
     if (E.mtp_d > 0 && forced.empty() && !ff) {
         long long offered = 0, accepted = 0;
         std::vector<int32_t> fix, drafts;

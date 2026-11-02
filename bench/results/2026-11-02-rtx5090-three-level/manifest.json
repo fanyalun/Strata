@@ -1,0 +1,186 @@
+{
+  "prepared_at_utc": "2026-11-02T10:21:56Z",
+  "sources": {
+    "sources": [
+      {
+        "repository": "openai/grade-school-math",
+        "revision": "3101c7d5072418e28b9008a6636bde82a006892c",
+        "path": "grade_school_math/data/test.jsonl",
+        "url": "https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl",
+        "bytes": 749738,
+        "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+        "decoded_bytes": 749738,
+        "decoded_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+        "rows": 1319
+      },
+      {
+        "repository": "openai/human-eval",
+        "revision": "b9453e8f1865df0a0057a1383767caa400acfbcf",
+        "path": "data/HumanEval.jsonl.gz",
+        "url": "https://raw.githubusercontent.com/openai/human-eval/b9453e8f1865df0a0057a1383767caa400acfbcf/data/HumanEval.jsonl.gz",
+        "bytes": 44877,
+        "sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef",
+        "decoded_bytes": 214438,
+        "decoded_sha256": "1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2",
+        "rows": 164
+      }
+    ]
+  },
+  "selection": {
+    "ordering": "original official JSONL file order, without sorting/filtering/randomization",
+    "per_dataset_warmup_source_indices": [
+      0,
+      1,
+      2
+    ],
+    "per_dataset_timed_source_indices": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "records": 22,
+    "warmup_records": 6,
+    "timed_records": 16,
+    "overlap": false
+  },
+  "protocol": {
+    "greedy": true,
+    "max_new": 256,
+    "three_level_depth": 3,
+    "three_level_loops": 6,
+    "preverify_top_h": 4,
+    "adaptive_draft_length": false,
+    "template": "explicit_shared_wrapper",
+    "system_message": null,
+    "gsm8k_user_content": "original question exactly",
+    "humaneval_user_prefix": "Complete the following Python function. Return only Python code.\n\n",
+    "humaneval_prompt_whitespace": "preserved byte-for-byte as Unicode UTF-8 text",
+    "wrapper_prefix": "<|im_start|>user\n",
+    "wrapper_suffix": "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "thinking": "empty closed think block in assistant generation prefix; no thinking request",
+    "answers_and_canonical_solutions_in_input": false,
+    "no_reference_code_executed": true,
+    "requested_dram_total_gib": 50,
+    "requested_vram": "actual32GB GPU; allocation/budget setup owned by benchmark runner"
+  },
+  "tokenizers": {
+    "q36": {
+      "path": "<ASSETS_DIR>/qwen36/tokenizer",
+      "files": {
+        "vocab.json": {
+          "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+          "bytes": 5737005
+        },
+        "merges.txt": {
+          "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+          "bytes": 3353258
+        },
+        "token_type.json": {
+          "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+          "bytes": 744960
+        },
+        "tokenizer.json": {
+          "sha256": "2297d930613fcea0cbade386046ba7328b3aea97a9e3e4ac4154eb7a6d617665",
+          "bytes": 541
+        },
+        "chat_template.jinja": {
+          "sha256": "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c",
+          "bytes": 8057
+        }
+      },
+      "pre": "qwen35",
+      "special_ids": {
+        "tokenizer.ggml.eos_token_id": 248046,
+        "tokenizer.ggml.padding_token_id": 248055,
+        "tokenizer.ggml.bos_token_id": 248044
+      },
+      "add_bos_token": false,
+      "native_template_used": false
+    },
+    "q38": {
+      "path": "<ASSETS_DIR>/pack-iq2_xs/tokenizer",
+      "files": {
+        "vocab.json": {
+          "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+          "bytes": 5737005
+        },
+        "merges.txt": {
+          "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+          "bytes": 3353258
+        },
+        "token_type.json": {
+          "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+          "bytes": 744960
+        },
+        "tokenizer.json": {
+          "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf",
+          "bytes": 541
+        },
+        "chat_template.jinja": {
+          "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+          "bytes": 9993
+        }
+      },
+      "pre": "qwen35",
+      "special_ids": {
+        "tokenizer.ggml.eos_token_id": 248046,
+        "tokenizer.ggml.padding_token_id": 248044,
+        "tokenizer.ggml.bos_token_id": 248044
+      },
+      "add_bos_token": false,
+      "native_template_used": false
+    }
+  },
+  "encoding": {
+    "module": "tools/strata_tokenizer.py",
+    "module_sha256": "6db1ea62d3edbaa64dce139088146ccf370933998d5f997cd5f41a39300075a6",
+    "parse_special": true,
+    "add_bos": false,
+    "both_models_equal_ids_for_all_records": true,
+    "decode_round_trip_all_records": true
+  },
+  "lengths": {
+    "gsm8k": {
+      "warmup": {
+        "min": 38,
+        "max": 77
+      },
+      "timed": {
+        "min": 47,
+        "max": 123
+      },
+      "all": {
+        "min": 38,
+        "max": 123
+      }
+    },
+    "humaneval": {
+      "warmup": {
+        "min": 108,
+        "max": 147
+      },
+      "timed": {
+        "min": 117,
+        "max": 173
+      },
+      "all": {
+        "min": 108,
+        "max": 173
+      }
+    }
+  },
+  "files": {
+    "inputs.jsonl": {
+      "bytes": 58910,
+      "sha256": "72b8f1bde0277e3ad85e2bf8a6a15c75cb63f3ab4f87fde72c7c2d312d700bd1"
+    }
+  },
+  "max_prompt_tokens": 173,
+  "max_prompt_plus_max_new": 429,
+  "max_prompt_plus_max_new_plus_one_anchor": 430
+}

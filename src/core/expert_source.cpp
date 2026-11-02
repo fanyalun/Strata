@@ -1124,13 +1124,22 @@ void FileExpertSource::io_window_tick() {
 // the queue's fill against the window budget (a busy drive takes only the surer guesses); the window's speculative bytes
 // stay within the budget; each job carries the layer clock by which it must have started (else the worker drops it).
 void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) {
-    if (!io_sched_ || !io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) { warm(layer, experts, n); return; }
+    const bool speculative = speculative_active_.load(std::memory_order_acquire);
+    if (!io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) {
+        if (!speculative) warm(layer, experts, n);
+        return;
+    }
+    if (!io_sched_ && !speculative) { warm(layer, experts, n); return; }
     if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
-    const uint64_t deadline = io_epoch_.load(std::memory_order_relaxed) + (uint64_t) std::max(1, ahead);
+    const uint64_t deadline = speculative ? speculative_full_base_.load(std::memory_order_relaxed) + (uint64_t) layer + 1
+        : io_epoch_.load(std::memory_order_relaxed) + (uint64_t) std::max(1, ahead);
+    const uint64_t window = speculative ? speculative_window_.load(std::memory_order_relaxed) : 0;
     bool any = false;
     {
         std::lock_guard<std::mutex> lk(io_mu_);
+        if (io_draining_ || (speculative && (!speculative_active_.load(std::memory_order_acquire) ||
+            window != speculative_window_.load(std::memory_order_relaxed)))) return;
         const uint64_t budget = io_budget_now();
         for (int64_t j = 0; j < n; ++j) {
             const int64_t e = experts[j];
@@ -1147,13 +1156,70 @@ void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const 
             for (const IoJob& q : io_jobs_)
                 if (q.layer == (int32_t) layer && q.expert == (int32_t) e) { dup = true; break; }
             if (dup) continue;
-            io_jobs_.push_back({(int32_t) layer, (int32_t) e, c, deadline, bytes});
+            io_jobs_.push_back({(int32_t) layer, (int32_t) e, c, deadline, bytes, window});
             io_q_bytes_ += bytes;
             io_win_bytes_ += bytes;
             any = true;
         }
     }
     if (any) io_cv_.notify_all();
+}
+
+void FileExpertSource::speculative_begin(uint64_t window_id) {
+    if (speculative_active_.load(std::memory_order_acquire)) speculative_end();
+    const uint64_t base = io_epoch_.load(std::memory_order_relaxed) + 1;
+    const uint64_t previous = speculative_window_.load(std::memory_order_relaxed);
+    // A request-local adapter can restart its counter while a previous scope's file read is still finishing.
+    speculative_window_.store(std::max(previous + 1, window_id), std::memory_order_relaxed);
+    speculative_full_base_.store(base, std::memory_order_relaxed);
+    speculative_stage_.store(SpeculativeStage::PreVerify, std::memory_order_relaxed);
+    io_epoch_.store(base, std::memory_order_relaxed);
+    speculative_active_.store(true, std::memory_order_release);
+    io_window_tick();
+    if (gate_on_) { gate_capacity(); gate_tick(); }
+}
+
+void FileExpertSource::speculative_stage(SpeculativeStage stage) {
+    speculative_stage_.store(stage, std::memory_order_release);
+}
+
+void FileExpertSource::speculative_hint(int64_t layer, const int32_t* ids, int64_t n_rows, int64_t k,
+                                        int64_t retained_rows, const int32_t* gpu_ready_slots) {
+    if (!speculative_active_.load(std::memory_order_acquire) || !io_pf_ || ids == nullptr ||
+        layer < 0 || layer >= n_layers_ || n_rows < 1 || k < 1 || retained_rows < 1 || retained_rows > n_rows) return;
+    std::vector<int64_t> experts;
+    for (int64_t i = 0; i < retained_rows * k; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert_ || (gpu_ready_slots != nullptr && gpu_ready_slots[e] >= 0) ||
+            has_resident(layer, e) || std::find(experts.begin(), experts.end(), (int64_t) e) != experts.end()) continue;
+        experts.push_back(e);
+    }
+    if (!experts.empty()) warm_scored(layer, experts.data(), nullptr, (int64_t) experts.size(), 1);
+}
+
+void FileExpertSource::speculative_end() {
+    if (!speculative_active_.load(std::memory_order_acquire)) return;
+    prefetch_end();
+    const uint64_t window = speculative_window_.load(std::memory_order_relaxed);
+    {
+        std::unique_lock<std::mutex> lk(io_mu_);
+        if (!speculative_active_.exchange(false, std::memory_order_acq_rel)) return;
+        io_draining_ = true;
+        for (size_t i = 0; i < io_jobs_.size();) {
+            if (io_jobs_[i].window != window) { ++i; continue; }
+            io_q_bytes_ -= std::min(io_q_bytes_, io_jobs_[i].bytes);
+            io_jobs_[i] = io_jobs_.back();
+            io_jobs_.pop_back();
+        }
+        io_pf_dropped_.fetch_add(io_q_.size(), std::memory_order_relaxed);
+        io_q_.clear();
+        io_epoch_.store(speculative_full_base_.load(std::memory_order_relaxed) + (uint64_t) n_layers_ + 1,
+                        std::memory_order_relaxed);
+        // A canceled branch cannot hand its stage storage to an exchange while a file worker still fills it.
+        io_cv_.wait(lk, [this] { return io_active_ == 0; });
+        io_draining_ = false;
+    }
+    io_cv_.notify_all();
 }
 
 void FileExpertSource::set_io_prefetch(bool on, int threads) {
@@ -1227,11 +1293,13 @@ void FileExpertSource::io_stop() {
     io_fds_.clear();
     io_pf_ = false;
     io_quit_ = false;
+    io_draining_ = false;
 }
 
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool ahead) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
+        if (io_draining_) return;
         if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
             io_q_.pop_front();
             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -1245,14 +1313,25 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool ahead) {
 // staged, and otherwise reads the whole blob into a staging buffer (copy_from_files preads what is not cached).
 void FileExpertSource::io_worker() {
     strata::platform::name_this_thread("strata-io");
+    struct Completion {
+        FileExpertSource& source;
+        ~Completion() {
+            {
+                std::lock_guard<std::mutex> lk(source.io_mu_);
+                --source.io_active_;
+            }
+            source.io_cv_.notify_all();
+        }
+    };
     for (;;) {
         int32_t layer, expert;
+        uint64_t job_window = 0, job_deadline = 0;
         bool ahead = true;   // a prediction (marked for the used / unused count), not a layer's own demand read
         {
             std::unique_lock<std::mutex> lk(io_mu_);
-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_jobs_.empty(); });
+            io_cv_.wait(lk, [&] { return io_quit_ || (!io_draining_ && (!io_q_.empty() || !io_jobs_.empty())); });
             if (io_quit_) return;
-            if (io_sched_ && io_q_.empty() && !io_jobs_.empty()) {   // (the layers' own reads in io_q_ go first)
+            if (io_q_.empty() && !io_jobs_.empty()) {   // (the layers' own reads in io_q_ go first)
                 // 149-prefetch: drop the jobs whose layer the decode has reached (its demand read covers them); then the
                 // earliest deadline, the surest guess first among equals
                 const uint64_t now = io_epoch_.load(std::memory_order_relaxed);
@@ -1275,6 +1354,8 @@ void FileExpertSource::io_worker() {
                 if (best == io_jobs_.size()) continue;   // all were late
                 layer = io_jobs_[best].layer;
                 expert = io_jobs_[best].expert;
+                job_window = io_jobs_[best].window;
+                job_deadline = io_jobs_[best].deadline;
                 io_q_bytes_ -= std::min(io_q_bytes_, io_jobs_[best].bytes);
                 io_jobs_[best] = io_jobs_.back();
                 io_jobs_.pop_back();
@@ -1285,7 +1366,9 @@ void FileExpertSource::io_worker() {
                 ahead = (io_q_.back().second & kIoAhead) != 0;
                 io_q_.pop_back();
             }
+            ++io_active_;
         }
+        const Completion completion{*this};
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
@@ -1341,6 +1424,10 @@ void FileExpertSource::io_worker() {
             std::lock_guard<std::mutex> lk(stage_mu_);
             if (stage_blob_ == 0) continue;
             const bool have = claim_stage((int64_t) layer * n_expert_ + expert, v, fill, /*ahead=*/true);
+            if (job_window != 0 && (have || fill)) {
+                stage_window_[v] = job_window;
+                stage_consume_[v] = job_deadline + 1;
+            }
             if (have || !fill) continue;   // already staged or being read, or no buffer
             stage_pf_[v] = 1;
             dst = stage_buf_[v].get();
@@ -1394,11 +1481,35 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
-    close();
-    if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
+        close();
         err = "FileExpertSource: the requested geometry does not match the loaded expert layout";
+        return false;
+    }
+    return open(pack_dir, layout, err);
+}
+
+bool FileExpertSource::open(const std::string& pack_dir, const strata::kernels::cpu::ExpertLayout& layout,
+                             std::string& err) {
+    return open_layout(pack_dir, layout, false, err);
+}
+
+bool FileExpertSource::open_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& layout,
+                                std::string& err) {
+    gguf_ = gguf;
+    return open_layout({}, layout, true, err);
+}
+
+bool FileExpertSource::open_layout(const std::string& pack_dir, const strata::kernels::cpu::ExpertLayout& layout,
+                                   bool gguf_only, std::string& err) {
+    const auto owned = std::make_shared<const strata::kernels::cpu::ExpertLayout>(layout);
+    close();
+    layout_ = owned;
+    const int64_t n_layers = layout.n_layers, n_expert = layout.n_expert;
+    if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
+    if (gguf_only && (!layout.native || gguf_.empty())) {
+        err = "FileExpertSource: GGUF ranges require a native layout and a model file";
         return false;
     }
     if ((uint64_t) n_layers > (uint64_t) std::numeric_limits<int64_t>::max() / (uint64_t) n_expert) {
@@ -1465,7 +1576,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         }
     }
     const std::string path = pack_dir + "/experts.bin";
-    if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
+    if (layout.native && !gguf_.empty() && (gguf_only || !std::filesystem::exists(path))) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
         n_layers_ = n_layers;
@@ -1566,6 +1677,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    speculative_end();
     prefetch_end();
     ram_stop();
     io_stop();
@@ -1639,6 +1751,8 @@ void FileExpertSource::close() {
         stage_used_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
+        stage_window_.clear();
+        stage_consume_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
         stage_seq_ = 0;
@@ -1700,7 +1814,7 @@ bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uin
 // blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
 bool FileExpertSource::open_gguf(std::string& err) {
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = *layout_;
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
@@ -1865,8 +1979,12 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     }
     v = stage_buf_.size();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
+    const bool speculative = speculative_active_.load(std::memory_order_acquire);
+    const uint64_t window = speculative_window_.load(std::memory_order_relaxed);
+    const uint64_t consumer = io_epoch_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < stage_buf_.size(); ++i)
-        if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
+        if (!stage_busy_[i] && !(speculative && stage_window_[i] == window && stage_consume_[i] > consumer) &&
+            (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
             stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
@@ -1908,6 +2026,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         stage_used_.push_back(0);
         stage_busy_.push_back(0);
         stage_pf_.push_back(0);
+        stage_window_.push_back(0);
+        stage_consume_.push_back(0);
         if (stage_buf_.size() == 512 && !stage_grew_) {
             stage_grew_ = true;
             std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
@@ -1915,6 +2035,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         }
     } else {
         stage_of_.erase(stage_key_[v]);
+        stage_window_[v] = 0;
+        stage_consume_[v] = 0;
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
         // #1237: a page-locked buffer is read by the DMA after the copy call returned: it is refilled only once the
         // last copy queued out of it (note_async_read) has finished.  Rare: the pool is sized so that a buffer asked
@@ -2173,8 +2295,8 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     // the mapping (its three tensors' rows), not assembled into a stage buffer first.  Decided here, before the lock.
     zc_keys_.clear();
     std::vector<char> zc_ok;
-    if (zc && !role_ptr_.empty() && !unmapped_ && direct_.empty() && strata::kernels::cpu::expert_layout().native &&
-        strata::kernels::cpu::expert_layout().fmt[(size_t) layer].tail_off == 0) {
+    if (zc && !role_ptr_.empty() && !unmapped_ && direct_.empty() && layout_->native &&
+        layout_->fmt[(size_t) layer].tail_off == 0) {
         zc_ok.assign((size_t) n, 0);
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -2696,6 +2818,8 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         stage_used_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
+        stage_window_.clear();
+        stage_consume_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
     }
@@ -2999,6 +3123,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
+    if (speculative_active_.load(std::memory_order_acquire)) {
+        warm_scored(layer, experts, nullptr, n, 1);
+        return;
+    }
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
@@ -3334,11 +3462,17 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
             ++epoch_;
             new_window = layer < last_layer_;
             last_layer_ = layer;
-            io_epoch_.store(epoch_, std::memory_order_relaxed);   // 149-prefetch: the workers' deadline clock
         }
+        const bool speculative = speculative_active_.load(std::memory_order_acquire);
+        const uint64_t clock = speculative ? speculative_full_base_.load(std::memory_order_relaxed) +
+            (speculative_stage_.load(std::memory_order_acquire) == SpeculativeStage::FullVerify ? (uint64_t) layer + 1 : 0)
+            : epoch_;
+        io_epoch_.store(clock, std::memory_order_relaxed);
     }
-    if (new_window && io_sched_) io_window_tick();
-    if (new_window && gate_on_ && tl_decode) { gate_capacity(); gate_tick(); }
+    if (new_window && !speculative_active_.load(std::memory_order_acquire)) {
+        if (io_sched_) io_window_tick();
+        if (gate_on_ && tl_decode) { gate_capacity(); gate_tick(); }
+    }
 }
 
 bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
@@ -3509,7 +3643,6 @@ bool FileExpertSource::pin_cache_complement(
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
-    const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
     if (!cache.valid()) { err = "FileExpertSource: the GPU expert cache is not open"; return false; }
@@ -3517,13 +3650,6 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const cudaError_t sync = cudaDeviceSynchronize();
-    if (sync != cudaSuccess) {
-        err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
-        (void) cudaGetLastError();
-        return false;
-    }
-
     // The GPU cache's experts, and the bytes each slot's expert takes here (for the lend region below).
     const int64_t n_slots = cache.slots();
     std::vector<std::pair<int32_t, int32_t>> primary_gpu_pairs;
@@ -3540,6 +3666,37 @@ bool FileExpertSource::pin_cache_complement(
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
         }
     }
+    return pin_complement(primary_gpu_pairs, pair_slot, slot_bytes, additional_gpu_pairs, lend_from_slot,
+                          err, pin, headroom_bytes, budget_bytes, rank);
+}
+
+bool FileExpertSource::pin_partition(const std::vector<std::pair<int32_t, int32_t>>& gpu_pairs,
+                                      std::string& err, uint64_t budget_bytes,
+                                      const std::vector<std::pair<int32_t, int32_t>>& rank,
+                                      bool pin, uint64_t headroom_bytes) {
+    if (!stage_lend_regions_.empty()) {
+        err = "FileExpertSource: a partition cannot retain prompt-loan duplicates";
+        return false;
+    }
+    return pin_complement(gpu_pairs, {}, {}, {}, -1, err, pin, headroom_bytes, budget_bytes, &rank, true);
+}
+
+bool FileExpertSource::pin_complement(
+    const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs, const std::vector<int32_t>& pair_slot,
+    const std::vector<uint64_t>& slot_bytes, const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
+    int64_t lend_from_slot, std::string& err, bool pin, uint64_t headroom_bytes, uint64_t budget_bytes,
+    const std::vector<std::pair<int32_t, int32_t>>* rank, bool allow_empty) {
+    err.clear();
+    const auto pin_t0 = std::chrono::steady_clock::now();
+    if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
+    if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (sync != cudaSuccess) {
+        err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
+        (void) cudaGetLastError();
+        return false;
+    }
+    const int64_t n_slots = (int64_t) slot_bytes.size();
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
@@ -3605,7 +3762,7 @@ bool FileExpertSource::pin_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        if (what_fits && held == 0 && !allow_empty) {   // #467: the legacy caller falls back to plain mmap
             err = "FileExpertSource: available memory cannot hold any expert of the complement";
             return false;
         }
@@ -4832,8 +4989,8 @@ namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: a window's rows (kWindowMaxT) of the model's 10 routed experts must fit, and a
 // larger k is refused at run time rather than written past them.  128 for the 8-row window (as it was), 256 for 16.
-constexpr int64_t kMaxWindowEntries = strata::kernels::kWindowMaxT <= 8 ? 128 : 256;
-static_assert(strata::kernels::kWindowMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+constexpr int64_t kMaxWindowEntries = strata::kernels::kSequenceVerifyMaxT <= 8 ? 128 : 256;
+static_assert(strata::kernels::kSequenceVerifyMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
 namespace {
@@ -4857,13 +5014,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
-    if (n_tok < 1 || n_tok > strata::kernels::kWindowMaxT) {
+    if (n_tok < 1 || n_tok > strata::kernels::kSequenceVerifyMaxT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
         d.fail_layer = d.layers;
         return;
     }
-    if (d.lookahead != nullptr) {
+    if (d.lookahead != nullptr && d.learn_foresight) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
             d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
@@ -4876,13 +5033,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) strata::kernels::kWindowMaxT);
+    const int64_t row_capacity = std::max<int64_t>(n_tok, strata::kernels::kWindowMaxT);
+    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) row_capacity);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
-    if (native && d.nact_multi.size() < (size_t) strata::kernels::kWindowMaxT * kNativeActBytes)
-        d.nact_multi.resize((size_t) strata::kernels::kWindowMaxT * kNativeActBytes);
+    if (native && d.nact_multi.size() < (size_t) row_capacity * kNativeActBytes)
+        d.nact_multi.resize((size_t) row_capacity * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (strata::kernels::kWindowMaxT * k));
+    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (row_capacity * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
@@ -4897,11 +5055,28 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }();
     d.cold_mode = cold_env >= 0 ? cold_env : (d.src != nullptr && d.src->linux_file_defaults() ? 4 : 0);
     pt("begin");
-    d.src->begin_layer(d.layers, ids, n_tok * k);
+    const auto active = [&](int64_t i) {
+        return (d.active_routes == nullptr || d.active_routes[i] != 0) &&
+            (d.plan == nullptr || d.plan->active_routes == nullptr || d.plan->active_routes[i] != 0);
+    };
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        if (ids[i] >= 0 && ids[i] < d.n_expert) continue;
+        d.failed = true;
+        d.fail = "a routed expert id is out of range";
+        d.fail_layer = d.layers;
+        d.fail_expert = ids[i];
+        return;
+    }
+    static thread_local std::vector<int32_t> demand_ids;
+    if (d.active_routes != nullptr || (d.plan != nullptr && d.plan->active_routes != nullptr)) {
+        demand_ids.clear();
+        for (int64_t i = 0; i < n_tok * k; ++i) if (active(i)) demand_ids.push_back(ids[i]);
+        d.src->begin_layer(d.layers, demand_ids.data(), (int64_t) demand_ids.size());
+    } else d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty())
+    if (d.record_usage && !d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+            if (active(i)) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
@@ -4919,9 +5094,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return false;
         };
         for (int64_t i = 0; i < n; ++i) {
+            if (!active(i)) { first_of[i] = -1; kind[i] = -3; continue; }
             first_of[i] = i;
             for (int64_t j = 0; j < i; ++j)
-                if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
+                if (active(j) && ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
             if (first_of[i] == i) {
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
@@ -4987,7 +5163,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
-                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                    if (d.fs != nullptr && d.learn_foresight) d.fs->note_miss(d.src, d.layers, e);
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
@@ -5039,6 +5215,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
+            if (!active(i)) { kind[i] = -3; continue; }
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
@@ -5154,6 +5331,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 ++d.tail_skipped;
+                continue;
+            }
+            if (kind[i] == -3) {
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                ++d.pruned_entries;
                 continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
@@ -5298,6 +5480,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
+}
+
+void expert_dispatch_observe_accepted(ExpertDispatch& d, int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k) {
+    if (ids == nullptr || layer < 0 || n_tok < 1 || k < 1) return;
+    std::vector<int32_t> seen;
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= d.n_expert) continue;
+        const size_t index = (size_t) layer * (size_t) d.n_expert + (size_t) e;
+        if (index < d.usage.size()) d.usage[index] += 1.0f;
+        if (d.fs == nullptr || (d.host_res != nullptr && d.host_res[index] >= 0) ||
+            std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
+        seen.push_back(e);
+    }
+    for (int32_t e : seen) d.fs->note_miss(nullptr, layer, e);
+    for (int32_t e : seen) d.fs->note_miss(d.src, layer, e);
 }
 
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k) {
@@ -6402,15 +6600,25 @@ void ForesightSwap::fill_loop() {
 }
 
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
+    if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) return false;
     std::lock_guard<std::mutex> smu_lk(smu_);
     const int s = where[(size_t) (layer * n_expert + expert)];
     if (s < 0) return false;
     Slot& sl = slot[(size_t) (layer * slots + s)];
+    if (!ready_locked(layer, expert, sl)) return false;
+    if (!frozen_) sl.last_ref = completed.load(std::memory_order_acquire);
+    ptr = sl.dptr;
+    ++hits;
+    return true;
+}
+
+bool ForesightSwap::ready_locked(int64_t layer, int32_t expert, Slot& sl) {
     if (!sl.ready) {
+        if (frozen_) { ++pending; return false; }
         if (!sl.loading || !sl.issued.load(std::memory_order_acquire)) { ++pending; return false; }
         const cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
         if (q != cudaSuccess) {
-            if (q != cudaErrorNotReady) cudaGetLastError();
+            if (q != cudaErrorNotReady) { cudaGetLastError(); failed.store(true, std::memory_order_release); }
             ++pending;
             return false;
         }
@@ -6425,6 +6633,7 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
             else {
                 cudaGetLastError();
                 ++verify_bad;
+                failed.store(true, std::memory_order_release);
                 sl.ready = false;                           // never serve it
                 where[(size_t) (layer * n_expert + expert)] = -1;
                 sl.expert = -1;
@@ -6432,15 +6641,39 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
             }
         }
     }
-    sl.last_ref = completed.load(std::memory_order_acquire);
-    ptr = sl.dptr;
-    ++hits;
     return true;
+}
+
+bool ForesightSwap::begin_window(std::vector<int32_t>& ready_slots, std::string& err) {
+    std::lock_guard<std::mutex> lk(smu_);
+    if (frozen_) { err = "foresight: an outer window is already active"; return false; }
+    if (failed.load(std::memory_order_acquire)) { err = "foresight: a copy failed"; return false; }
+    ready_slots.assign((size_t) (n_layers * n_expert), -1);
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        const OnDevice on(layer_dev[(size_t) layer]);
+        for (int s = 0; s < slots; ++s) {
+            Slot& sl = slot[(size_t) (layer * slots + s)];
+            if (sl.expert < 0 || sl.expert >= n_expert || !ready_locked(layer, sl.expert, sl)) continue;
+            ready_slots[(size_t) (layer * n_expert + sl.expert)] = s;
+        }
+    }
+    if (failed.load(std::memory_order_acquire)) { err = "foresight: a copy or byte verification failed"; return false; }
+    frozen_ = true;
+    return true;
+}
+
+void ForesightSwap::end_window() {
+    {
+        std::lock_guard<std::mutex> lk(smu_);
+        frozen_ = false;
+    }
+    window_cv_.notify_all();
 }
 
 void ForesightSwap::hold(int64_t layer, int32_t expert) {
     if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) return;
-    std::lock_guard<std::mutex> smu_lk(smu_);
+    std::unique_lock<std::mutex> smu_lk(smu_);
+    window_cv_.wait(smu_lk, [this] { return !frozen_; });
     const size_t key = (size_t) (layer * n_expert + expert);
     const int s = where[key];
     where[key] = kHeld;
@@ -6459,7 +6692,17 @@ void ForesightSwap::unhold(int64_t layer, int32_t expert) {
 }
 
 void ForesightSwap::note_miss(ExpertSource* src, int64_t layer, int32_t expert) {
+    if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) return;
     std::lock_guard<std::mutex> smu_lk(smu_);
+    if (frozen_ || failed.load(std::memory_order_relaxed)) return;
+    const int s = where[(size_t) (layer * n_expert + expert)];
+    if (s >= 0) {
+        Slot& sl = slot[(size_t) (layer * slots + s)];
+        if (sl.ready) sl.last_ref = completed.load(std::memory_order_acquire);
+        return;
+    }
+    // A null source protects accepted ready hits before the batch's miss admissions.
+    if (src == nullptr) return;
     request_locked(src, layer, expert, false);
 }
 
@@ -6470,7 +6713,7 @@ void ForesightSwap::predict(ExpertSource* src, int64_t layer, int32_t expert) {
 }
 
 void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted_copy) {
-    if (failed.load(std::memory_order_relaxed)) return;
+    if (frozen_ || failed.load(std::memory_order_relaxed)) return;
     const size_t key = (size_t) (layer * n_expert + expert);
     if (where[key] != -1) return;                       // already on its way, or held by an exchange (#2134)
     const uint64_t now = completed.load(std::memory_order_acquire);
